@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this fork's additions, please cite it as below."
+title: "Gastown — getHarshOnline Fork"
+type: software
+authors:
+  - family-names: "Joshi"
+    given-names: "Harsh"
+    email: "info@rawthoughts.in"
+    website: "https://rawthoughts.in"
+    affiliation: "RawThoughts Enterprises Private Limited"
+repository-code: "https://github.com/getHarshOnline/gastown"
+url: "https://rawthoughts.in/JARVIS/gastown"
+abstract: >-
+  getHarshOnline fork of Gastown multi-agent orchestrator. Dolt 3307
+  integration for persistent beads/agent state. Layer 3 (Execution) in
+  the JARVIS agent OS.
+keywords:
+  - multi-agent
+  - orchestration
+  - code-agents
+license: AGPL-3.0-or-later
