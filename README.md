@@ -1,3 +1,5 @@
+> **[getHarshOnline/gastown](https://github.com/getHarshOnline/gastown)** — fork of [steveyegge/gastown](https://github.com/steveyegge/gastown) maintained on the **`gho`** branch with upstream syncs. Integrates Gastown as the execution layer (Layer 3) with Dolt :3307 persistence, plugin architecture for memory context injection, and structured work tracking (beads/convoys).
+
 # Gas Town
 
 **Multi-agent orchestration system for Claude Code with persistent work tracking**
