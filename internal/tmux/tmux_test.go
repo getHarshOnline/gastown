@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -481,6 +482,51 @@ func TestIsAgentRunning_NonexistentSession(t *testing.T) {
 	}
 }
 
+func TestIsRuntimeRunningChecked_NonexistentSessionErrors(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-runtime-missing-" + t.Name()
+	_ = tm.KillSession(sessionName)
+
+	running, err := tm.IsRuntimeRunningChecked(sessionName, []string{"sleep"})
+	if err == nil {
+		t.Fatal("expected checked runtime query to return an error for missing session")
+	}
+	if running {
+		t.Fatal("expected missing session to report not running")
+	}
+	if tm.IsRuntimeRunning(sessionName, []string{"sleep"}) {
+		t.Fatal("legacy bool wrapper should collapse query errors to false")
+	}
+}
+
+func TestIsRuntimeRunning_AgentNameRequiresCursorSession(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-runtime-agent-filter-" + t.Name()
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommand(sessionName, "", "sleep 60"); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	// sleep matches; "agent" in the list is ignored when session does not declare Cursor
+	if !tm.IsRuntimeRunning(sessionName, []string{"agent", "sleep"}) {
+		t.Error("expected sleep to match when agent is stripped for non-cursor sessions")
+	}
+	if tm.IsRuntimeRunning(sessionName, []string{"agent"}) {
+		t.Error("expected bare agent not to match without GT_AGENT=cursor / GT_PROCESS_NAMES")
+	}
+	if err := tm.SetEnvironment(sessionName, "GT_AGENT", "cursor"); err != nil {
+		t.Fatalf("SetEnvironment: %v", err)
+	}
+	// With Cursor declared, "agent" is kept in the filter list (pane is still sleep — no match on agent alone)
+	if tm.IsRuntimeRunning(sessionName, []string{"agent"}) {
+		t.Error("pane is sleep, not agent — should not match on agent name alone")
+	}
+	if !tm.IsRuntimeRunning(sessionName, []string{"agent", "sleep"}) {
+		t.Error("expected sleep to still match with GT_AGENT=cursor")
+	}
+}
+
 func TestIsRuntimeRunning(t *testing.T) {
 	tm := newTestTmux(t)
 	sessionName := "gt-test-runtime-" + t.Name()
@@ -506,46 +552,45 @@ func TestIsRuntimeRunning(t *testing.T) {
 
 func TestIsRuntimeRunning_ShellWithNodeChild(t *testing.T) {
 	tm := newTestTmux(t)
-	sessionName := "gt-test-shell-child-" + t.Name()
 
-	// Clean up any existing session
-	_ = tm.KillSession(sessionName)
+	// Direct path: tmux runs the process as the pane command directly.
+	// This simulates a bundled agent binary (e.g. the standalone claude binary)
+	// where the pane command IS the agent process.
+	t.Run("direct", func(t *testing.T) {
+		sessionName := "gt-test-runtime-direct"
+		_ = tm.KillSession(sessionName)
 
-	// Create session with "bash -c" running a node process
-	// Use a simple node command that runs for a few seconds
-	cmd := `node -e "setTimeout(() => {}, 10000)"`
-	if err := tm.NewSessionWithCommand(sessionName, "", cmd); err != nil {
-		t.Fatalf("NewSessionWithCommand: %v", err)
-	}
-	defer func() { _ = tm.KillSession(sessionName) }()
-
-	// Give the node process time to start
-	// WaitForCommand waits until NOT running bash/zsh/sh
-	shellsToExclude := []string{"bash", "zsh", "sh"}
-	err := tm.WaitForCommand(sessionName, shellsToExclude, 2000*1000000) // 2 second timeout
-	if err != nil {
-		// If we timeout waiting, it means the pane command is still a shell
-		// This is the case we're testing - shell with a node child
-		paneCmd, _ := tm.GetPaneCommand(sessionName)
-		t.Logf("Pane command is %q - testing shell+child detection", paneCmd)
-	}
-
-	// Now test IsRuntimeRunning - it should detect node as a child process
-	processNames := []string{"node", "claude"}
-	paneCmd, _ := tm.GetPaneCommand(sessionName)
-	if paneCmd == "node" {
-		// Direct node detection should work
-		if !tm.IsRuntimeRunning(sessionName, processNames) {
-			t.Error("IsRuntimeRunning should return true when pane command is 'node'")
+		if err := tm.NewSessionWithCommand(sessionName, "", "sleep 10"); err != nil {
+			t.Fatalf("NewSessionWithCommand: %v", err)
 		}
-	} else {
-		// Pane is a shell (bash/zsh) with node as child
-		// The child process detection should catch this
-		got := tm.IsRuntimeRunning(sessionName, processNames)
-		t.Logf("Pane command: %q, IsRuntimeRunning: %v", paneCmd, got)
-		// Note: This may or may not detect depending on how tmux runs the command.
-		// On some systems, tmux runs the command directly; on others via a shell.
-	}
+		defer func() { _ = tm.KillSession(sessionName) }()
+
+		if !tm.IsRuntimeRunning(sessionName, []string{"sleep"}) {
+			paneCmd, _ := tm.GetPaneCommand(sessionName)
+			t.Errorf("IsRuntimeRunning should return true for direct process (pane cmd: %q)", paneCmd)
+		}
+	})
+
+	// Shell+child path: tmux runs a shell which spawns the agent as a child.
+	// This simulates an npm-installed agent (e.g. claude via node) where the
+	// pane command is sh/bash and the agent is a descendant process.
+	t.Run("shell_with_child", func(t *testing.T) {
+		sessionName := "gt-test-runtime-shell-child"
+		_ = tm.KillSession(sessionName)
+
+		if err := tm.NewSessionWithCommand(sessionName, "", "sh -c 'sleep 10'"); err != nil {
+			t.Fatalf("NewSessionWithCommand: %v", err)
+		}
+		defer func() { _ = tm.KillSession(sessionName) }()
+
+		// Give the child process a moment to start
+		time.Sleep(100 * time.Millisecond)
+
+		if !tm.IsRuntimeRunning(sessionName, []string{"sleep"}) {
+			paneCmd, _ := tm.GetPaneCommand(sessionName)
+			t.Errorf("IsRuntimeRunning should return true for child process (pane cmd: %q)", paneCmd)
+		}
+	})
 }
 
 // TestGetPaneCommand_MultiPane verifies that GetPaneCommand returns pane 0's
@@ -670,6 +715,118 @@ func TestGetAllDescendants(t *testing.T) {
 				t.Errorf("getAllDescendants returned non-numeric PID: %q", pid)
 			}
 		}
+	}
+}
+
+func TestDescendantsFromPS(t *testing.T) {
+	t.Parallel()
+
+	snapshot := []byte(`
+1 0 root
+2 1 bash
+3 1 zsh
+4 2 node
+5 4 claude
+2 1 bash-duplicate
+bad header row
+8 bad nope
+1 5 root-cycle
+7 99 node
+`)
+
+	got := descendantsFromPS("1", snapshot)
+	want := []string{"5", "4", "2", "3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("descendantsFromPS deepest-first = %v, want %v", got, want)
+	}
+
+	if got := descendantsFromPS("42", snapshot); len(got) != 0 {
+		t.Fatalf("descendantsFromPS missing root = %v, want empty", got)
+	}
+
+	if got := descendantsFromPS("not-a-pid", snapshot); len(got) != 0 {
+		t.Fatalf("descendantsFromPS invalid root = %v, want empty", got)
+	}
+}
+
+func TestHasDescendantWithNamesFromPS(t *testing.T) {
+	t.Parallel()
+
+	snapshot := []byte(`
+1 0 bash
+2 1 /usr/local/bin/node
+3 2 /Users/peter/bin/claude
+4 1 tmux: client
+5 1 claude-helper
+6 5 nodejs
+7 99 node
+8 0 opencode
+9 8 /opt/homebrew/bin/bun
+10 9 opencode
+1 10 root-cycle
+bad header row
+11 bad nope
+`)
+
+	tests := []struct {
+		name  string
+		pid   string
+		names []string
+		depth int
+		want  bool
+	}{
+		{name: "direct child basename", pid: "1", names: []string{"node"}, want: true},
+		{name: "grandchild basename path", pid: "1", names: []string{"claude"}, want: true},
+		{name: "multi word comm", pid: "1", names: []string{"tmux: client"}, want: true},
+		{name: "exact match only", pid: "1", names: []string{"nodejs"}, want: true},
+		{name: "no substring match", pid: "1", names: []string{"claude-helper"}, want: true},
+		{name: "unrelated ambient ignored", pid: "42", names: []string{"node", "opencode", "bun"}, want: false},
+		{name: "empty names", pid: "1", names: []string{"", "  "}, want: false},
+		{name: "depth limit preserves current semantics", pid: "8", names: []string{"opencode"}, depth: 10, want: false},
+		{name: "invalid root", pid: "nope", names: []string{"node"}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := hasDescendantWithNamesFromPS(tt.pid, tt.names, tt.depth, snapshot)
+			if got != tt.want {
+				t.Fatalf("hasDescendantWithNamesFromPS(%q, %v, %d) = %v, want %v", tt.pid, tt.names, tt.depth, got, tt.want)
+			}
+		})
+	}
+
+	substringSnapshot := []byte(`
+1 0 bash
+2 1 claude-helper
+3 1 nodejs
+`)
+	if hasDescendantWithNamesFromPS("1", []string{"claude", "node"}, 0, substringSnapshot) {
+		t.Fatal("hasDescendantWithNamesFromPS matched a process name substring")
+	}
+}
+
+func TestHasDescendantWithNamesFromPSDoesNotMatchRoot(t *testing.T) {
+	t.Parallel()
+
+	snapshot := []byte(`1 0 node`)
+	if hasDescendantWithNamesFromPS("1", []string{"node"}, 0, snapshot) {
+		t.Fatal("hasDescendantWithNamesFromPS matched the root as its own descendant")
+	}
+}
+
+func TestHasDescendantWithNamesPosixCheckedReportsSnapshotError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX helper test")
+	}
+
+	t.Setenv("PATH", "")
+	found, err := hasDescendantWithNamesPosixChecked("1", []string{"node"}, 0)
+	if err == nil {
+		t.Fatal("hasDescendantWithNamesPosixChecked with missing ps error = nil, want error")
+	}
+	if found {
+		t.Fatal("hasDescendantWithNamesPosixChecked with missing ps found match, want false")
 	}
 }
 
@@ -973,20 +1130,23 @@ func TestCleanupOrphanedSessions(t *testing.T) {
 	_ = tm.KillSession(hqSession)
 	_ = tm.KillSession(nonGtSession)
 
-	// Create zombie sessions (tmux alive, but just shell - no Claude)
-	if err := tm.NewSession(gtSession, ""); err != nil {
-		t.Fatalf("NewSession(gt): %v", err)
+	// Create zombie sessions (tmux alive, but process is sleep - no Claude/node).
+	// Use NewSessionWithCommand with sleep to avoid loading .zshrc, which spawns
+	// a node process on this system. A node child of the zsh shell would cause
+	// IsAgentAlive to return true, preventing cleanup (gt-it10f6p).
+	if err := tm.NewSessionWithCommand(gtSession, "", "sleep 9999"); err != nil {
+		t.Fatalf("NewSessionWithCommand(gt): %v", err)
 	}
 	defer func() { _ = tm.KillSession(gtSession) }()
 
-	if err := tm.NewSession(hqSession, ""); err != nil {
-		t.Fatalf("NewSession(hq): %v", err)
+	if err := tm.NewSessionWithCommand(hqSession, "", "sleep 9999"); err != nil {
+		t.Fatalf("NewSessionWithCommand(hq): %v", err)
 	}
 	defer func() { _ = tm.KillSession(hqSession) }()
 
 	// Create a non-GT session (should NOT be cleaned up)
-	if err := tm.NewSession(nonGtSession, ""); err != nil {
-		t.Fatalf("NewSession(other): %v", err)
+	if err := tm.NewSessionWithCommand(nonGtSession, "", "sleep 9999"); err != nil {
+		t.Fatalf("NewSessionWithCommand(other): %v", err)
 	}
 	defer func() { _ = tm.KillSession(nonGtSession) }()
 
@@ -1294,6 +1454,40 @@ func TestFindAgentPane_SinglePane(t *testing.T) {
 	}
 }
 
+func TestFindAgentPane_IgnoresPaneIDFromOtherSession(t *testing.T) {
+	tm := newTestTmux(t)
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+	targetSession := "gt-test-findagent-target-" + suffix
+	otherSession := "gt-test-findagent-other-" + suffix
+
+	_ = tm.KillSession(targetSession)
+	_ = tm.KillSession(otherSession)
+	if err := tm.NewSession(targetSession, ""); err != nil {
+		t.Fatalf("NewSession target: %v", err)
+	}
+	defer func() { _ = tm.KillSession(targetSession) }()
+	if err := tm.NewSession(otherSession, ""); err != nil {
+		t.Fatalf("NewSession other: %v", err)
+	}
+	defer func() { _ = tm.KillSession(otherSession) }()
+
+	otherPane, err := tm.GetPaneID(otherSession)
+	if err != nil {
+		t.Fatalf("GetPaneID other: %v", err)
+	}
+	if err := tm.SetEnvironment(targetSession, "GT_PANE_ID", otherPane); err != nil {
+		t.Fatalf("SetEnvironment GT_PANE_ID: %v", err)
+	}
+
+	paneID, err := tm.FindAgentPane(targetSession)
+	if err != nil {
+		t.Fatalf("FindAgentPane: %v", err)
+	}
+	if paneID == otherPane {
+		t.Fatalf("FindAgentPane returned pane %q from another session", paneID)
+	}
+}
+
 func TestFindAgentPane_MultiPaneWithNode(t *testing.T) {
 	tm := newTestTmux(t)
 	sessionName := "gt-test-findagent-multi-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
@@ -1306,14 +1500,13 @@ func TestFindAgentPane_MultiPaneWithNode(t *testing.T) {
 	}
 	defer func() { _ = tm.KillSession(sessionName) }()
 
-	// Split and run node in the new pane (simulating an agent)
-	_, err := tm.run("split-window", "-t", sessionName, "-d",
-		"node", "-e", "setTimeout(() => {}, 30000)")
+	// Split and run sleep in the new pane (simulating an agent process)
+	_, err := tm.run("split-window", "-t", sessionName, "-d", "sleep", "10")
 	if err != nil {
 		t.Fatalf("split-window: %v", err)
 	}
 
-	// Give node a moment to start
+	// Give sleep a moment to start
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify we have 2 panes
@@ -1327,28 +1520,28 @@ func TestFindAgentPane_MultiPaneWithNode(t *testing.T) {
 		t.Skipf("Expected 2 panes, got %d — skipping multi-pane test", len(lines))
 	}
 
-	// FindAgentPane should find the node pane
+	// FindAgentPane should find the sleep pane
 	paneID, err := tm.FindAgentPane(sessionName)
 	if err != nil {
 		t.Fatalf("FindAgentPane: %v", err)
 	}
 
-	// Verify it found the correct pane (the one running node)
+	// Verify it found the correct pane (the one running sleep)
 	if paneID == "" {
-		t.Log("FindAgentPane returned empty — node may not have started yet or detection missed it")
-		// Not a hard failure since node startup timing varies
+		t.Log("FindAgentPane returned empty — sleep may not have started yet or detection missed it")
+		// Not a hard failure since process startup timing varies
 		return
 	}
 
-	// Verify the returned pane is actually running node
+	// Verify the returned pane is actually running sleep
 	cmdOut, err := tm.run("display-message", "-t", paneID, "-p", "#{pane_current_command}")
 	if err != nil {
 		t.Fatalf("display-message: %v", err)
 	}
 	paneCmd := strings.TrimSpace(cmdOut)
 	t.Logf("Agent pane %s running: %s", paneID, paneCmd)
-	if paneCmd != "node" {
-		t.Errorf("FindAgentPane returned pane running %q, want 'node'", paneCmd)
+	if paneCmd != "sleep" {
+		t.Errorf("FindAgentPane returned pane running %q, want 'sleep'", paneCmd)
 	}
 }
 
@@ -1702,6 +1895,304 @@ func TestNudgeSession_WithRetry(t *testing.T) {
 	}
 }
 
+func TestNudgeSession_WithStoredPaneID(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-nudge-paneid-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	time.Sleep(200 * time.Millisecond)
+
+	paneID, err := tm.GetPaneID(sessionName)
+	if err != nil {
+		t.Fatalf("GetPaneID: %v", err)
+	}
+	if err := tm.SetEnvironment(sessionName, "GT_PANE_ID", paneID); err != nil {
+		t.Fatalf("SetEnvironment GT_PANE_ID: %v", err)
+	}
+
+	if err := tm.NudgeSession(sessionName, "test message"); err != nil {
+		t.Fatalf("NudgeSession() with GT_PANE_ID = %v, want nil", err)
+	}
+}
+
+// TestNudgeSession_WakesAgentWindowNotActiveWindow is a regression test for a
+// missed-wake bug in multi-window sessions. NudgeSessionWithOpts used to pass
+// the bare session name to WakePaneIfDetached, which resizes the session's
+// *active* window. When an agent session also has another window open and
+// focused (e.g. a `gt feed -w` window), the agent's pane lives in a now-inactive
+// window, so the SIGWINCH went to the wrong window and the agent never woke.
+//
+// The wake's resize dance ends by setting the targeted window's window-size
+// option to "latest". By pre-setting both windows to "manual" and checking which
+// one flips to "latest" after the nudge, we can assert the agent's window — not
+// the active window — was the one woken.
+func TestNudgeSession_WakesAgentWindowNotActiveWindow(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-nudge-multiwin-" + fmt.Sprintf("%d", time.Now().UnixNano()%100000)
+
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// The agent pane is window 0's pane. Record it as the declared identity so
+	// FindAgentPane resolves the nudge target to it.
+	agentPane, err := tm.GetPaneID(sessionName)
+	if err != nil {
+		t.Fatalf("GetPaneID: %v", err)
+	}
+	if err := tm.SetEnvironment(sessionName, "GT_PANE_ID", agentPane); err != nil {
+		t.Fatalf("SetEnvironment GT_PANE_ID: %v", err)
+	}
+
+	// Open a second window, which tmux makes the active window. This puts the
+	// agent's pane in a non-active window — the scenario that exposed the bug.
+	if _, err := tm.run("new-window", "-t", sessionName, "-n", "feed"); err != nil {
+		t.Fatalf("new-window: %v", err)
+	}
+
+	// Pre-set both windows to window-size "manual". The wake resets only the
+	// window it targets back to "latest", giving us a deterministic signal.
+	for _, win := range []string{":0", ":1"} {
+		if _, err := tm.run("set-option", "-w", "-t", sessionName+win, "window-size", "manual"); err != nil {
+			t.Fatalf("set-option window-size manual on %s: %v", sessionName+win, err)
+		}
+	}
+
+	if err := tm.NudgeSession(sessionName, "test message"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+
+	windowSize := func(win string) string {
+		out, err := tm.run("show-options", "-w", "-t", sessionName+win, "window-size")
+		if err != nil {
+			t.Fatalf("show-options window-size on %s: %v", sessionName+win, err)
+		}
+		fields := strings.Fields(strings.TrimSpace(out))
+		if len(fields) < 2 {
+			return ""
+		}
+		return fields[1]
+	}
+
+	// Agent window (0) must have been woken; active window (1) must be untouched.
+	if got := windowSize(":0"); got != "latest" {
+		t.Errorf("agent window (0) window-size = %q, want %q (agent's window was not woken)", got, "latest")
+	}
+	if got := windowSize(":1"); got != "manual" {
+		t.Errorf("active window (1) window-size = %q, want %q (wrong window was woken)", got, "manual")
+	}
+}
+
+func TestCanonicalPaneTargetFromDisplay(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		expectedSession string
+		out             string
+		want            string
+		wantOK          bool
+	}{
+		{
+			name:            "valid target",
+			expectedSession: "gt-alpha",
+			out:             "gt-alpha\t0\t0",
+			want:            "gt-alpha:0.0",
+			wantOK:          true,
+		},
+		{
+			name:            "valid multi window",
+			expectedSession: "gt-alpha",
+			out:             "gt-alpha\t12\t3",
+			want:            "gt-alpha:12.3",
+			wantOK:          true,
+		},
+		{
+			name:            "wrong session",
+			expectedSession: "gt-alpha",
+			out:             "gt-beta\t0\t0",
+			wantOK:          false,
+		},
+		{
+			name:            "malformed combined target",
+			expectedSession: "gt-alpha",
+			out:             "gt-alpha:0.0",
+			wantOK:          false,
+		},
+		{
+			name:            "empty output",
+			expectedSession: "gt-alpha",
+			out:             "",
+			wantOK:          false,
+		},
+		{
+			name:            "non numeric window",
+			expectedSession: "gt-alpha",
+			out:             "gt-alpha\tactive\t0",
+			wantOK:          false,
+		},
+		{
+			name:            "non numeric pane",
+			expectedSession: "gt-alpha",
+			out:             "gt-alpha\t0\tactive",
+			wantOK:          false,
+		},
+		{
+			name:            "negative index",
+			expectedSession: "gt-alpha",
+			out:             "gt-alpha\t0\t-1",
+			wantOK:          false,
+		},
+		{
+			name:            "signed index",
+			expectedSession: "gt-alpha",
+			out:             "gt-alpha\t+1\t0",
+			wantOK:          false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := canonicalPaneTargetFromDisplay(tt.expectedSession, tt.out)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if got != tt.want {
+				t.Errorf("target = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalPaneTargetResolvesAndFallsBack(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-canonical-pane-" + fmt.Sprintf("%d", time.Now().UnixNano()%100000)
+	otherSession := "gt-test-canonical-other-" + fmt.Sprintf("%d", time.Now().UnixNano()%100000)
+
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession target: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	if err := tm.NewSession(otherSession, os.TempDir()); err != nil {
+		t.Fatalf("NewSession other: %v", err)
+	}
+	defer func() { _ = tm.KillSession(otherSession) }()
+
+	time.Sleep(200 * time.Millisecond)
+	fallback := sessionName + ":0.0"
+	if got := tm.canonicalPaneTarget(sessionName, ""); got != fallback {
+		t.Errorf("empty pane target = %q, want %q", got, fallback)
+	}
+	if got := tm.canonicalPaneTarget(sessionName, "%999999"); got != fallback {
+		t.Errorf("missing pane target = %q, want %q", got, fallback)
+	}
+
+	paneID, err := tm.GetPaneID(sessionName)
+	if err != nil {
+		t.Fatalf("GetPaneID target: %v", err)
+	}
+	if got := tm.canonicalPaneTarget(sessionName, paneID); got != fallback {
+		t.Errorf("live pane target = %q, want %q", got, fallback)
+	}
+
+	otherPane, err := tm.GetPaneID(otherSession)
+	if err != nil {
+		t.Fatalf("GetPaneID other: %v", err)
+	}
+	if got := tm.canonicalPaneTarget(sessionName, otherPane); got != fallback {
+		t.Errorf("cross-session pane target = %q, want %q", got, fallback)
+	}
+}
+
+func TestNudgeSession_StalePaneIDFallsBackToFirstPane(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-nudge-stale-pane-" + fmt.Sprintf("%d", time.Now().UnixNano()%100000)
+	otherSession := "gt-test-nudge-other-pane-" + fmt.Sprintf("%d", time.Now().UnixNano()%100000)
+
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession target: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	if err := tm.NewSession(otherSession, os.TempDir()); err != nil {
+		t.Fatalf("NewSession other: %v", err)
+	}
+	defer func() { _ = tm.KillSession(otherSession) }()
+
+	time.Sleep(200 * time.Millisecond)
+	otherPane, err := tm.GetPaneID(otherSession)
+	if err != nil {
+		t.Fatalf("GetPaneID other: %v", err)
+	}
+	if err := tm.SetEnvironment(sessionName, "GT_PANE_ID", otherPane); err != nil {
+		t.Fatalf("SetEnvironment GT_PANE_ID: %v", err)
+	}
+	if _, err := tm.run("new-window", "-t", sessionName, "-n", "active"); err != nil {
+		t.Fatalf("new-window: %v", err)
+	}
+
+	marker := "GT_NUDGE_STALE_PANE_FALLBACK_" + fmt.Sprintf("%d", time.Now().UnixNano()%100000)
+	if err := tm.NudgeSession(sessionName, "echo "+marker); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	firstPane, err := tm.CapturePane(sessionName+":0.0", 80)
+	if err != nil {
+		t.Fatalf("CapturePane first: %v", err)
+	}
+	activePane, err := tm.CapturePane(sessionName+":1.0", 80)
+	if err != nil {
+		t.Fatalf("CapturePane active: %v", err)
+	}
+	otherPaneContent, err := tm.CapturePane(otherSession+":0.0", 80)
+	if err != nil {
+		t.Fatalf("CapturePane other: %v", err)
+	}
+
+	if !strings.Contains(firstPane, marker) {
+		t.Fatalf("first pane did not receive nudge marker %q; content:\n%s", marker, firstPane)
+	}
+	if strings.Contains(activePane, marker) {
+		t.Fatalf("active fallback pane received stale-pane nudge marker %q; content:\n%s", marker, activePane)
+	}
+	if strings.Contains(otherPaneContent, marker) {
+		t.Fatalf("cross-session stale pane received nudge marker %q; content:\n%s", marker, otherPaneContent)
+	}
+}
+
+// TestAdaptiveTextDelay verifies the delay scaling logic for post-text delivery.
+func TestAdaptiveTextDelay(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		msgLen  int
+		wantMin time.Duration
+		wantMax time.Duration
+	}{
+		{"empty", 0, 500 * time.Millisecond, 500 * time.Millisecond},
+		{"small single chunk", 100, 500 * time.Millisecond, 500 * time.Millisecond},
+		{"exactly one chunk", 512, 500 * time.Millisecond, 500 * time.Millisecond},
+		{"two chunks", 513, 525 * time.Millisecond, 525 * time.Millisecond},
+		{"five chunks", 2048 + 1, 600 * time.Millisecond, 600 * time.Millisecond},
+		{"huge message capped", 100000, 2 * time.Second, 2 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := adaptiveTextDelay(tt.msgLen)
+			if got < tt.wantMin || got > tt.wantMax {
+				t.Errorf("adaptiveTextDelay(%d) = %v, want [%v, %v]", tt.msgLen, got, tt.wantMin, tt.wantMax)
+			}
+		})
+	}
+}
+
 // TestMatchesPromptPrefix verifies that prompt matching handles non-breaking
 // spaces (NBSP, U+00A0) correctly. Claude Code uses NBSP after its > prompt
 // character, but the default ReadyPromptPrefix uses a regular space.
@@ -1781,6 +2272,164 @@ func TestWaitForIdle_Timeout(t *testing.T) {
 	}
 	if !errors.Is(err, ErrIdleTimeout) {
 		t.Errorf("expected ErrIdleTimeout, got: %v", err)
+	}
+}
+
+func TestHasBusyIndicator(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{"claude status busy", "⏵⏵ bypass permissions on ... · esc to interrupt", true},
+		{"codex status busy", "• Working (2m 18s • esc to interrupt)", true},
+		{"idle line", "› Review ready notification", false},
+		{"blank", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasBusyIndicator(tt.line); got != tt.want {
+				t.Errorf("hasBusyIndicator(%q) = %v, want %v", tt.line, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestShouldSendEscapeForLines guards against the regression where a nudge
+// sends the vim-mode Escape keystroke while the agent is actively generating,
+// interrupting its current turn (e.g. the Mayor). When the pane shows the busy
+// indicator ("esc to interrupt"), the Escape must be suppressed.
+func TestShouldSendEscapeForLines(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		lines []string
+		want  bool
+	}{
+		{
+			name:  "claude generating - suppress escape",
+			lines: []string{"✻ Cogitating… (12s · ↑ 2.1k tokens · esc to interrupt)"},
+			want:  false,
+		},
+		{
+			name:  "codex working - suppress escape",
+			lines: []string{"• Working (2m 18s • esc to interrupt)"},
+			want:  false,
+		},
+		{
+			name:  "busy indicator among multiple lines - suppress escape",
+			lines: []string{"tool output", "more output", "⏵⏵ bypass permissions on · esc to interrupt"},
+			want:  false,
+		},
+		{
+			name:  "idle ready prompt - allow escape",
+			lines: []string{"❯ "},
+			want:  true,
+		},
+		{
+			name:  "idle with typed nudge text - allow escape",
+			lines: []string{"❯ HEALTH_CHECK: heartbeat stale, respond to confirm"},
+			want:  true,
+		},
+		{
+			name:  "no lines captured - allow escape (not busy)",
+			lines: nil,
+			want:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldSendEscapeForLines(tt.lines); got != tt.want {
+				t.Errorf("shouldSendEscapeForLines(%q) = %v, want %v", tt.lines, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestShouldSendEscape_LivePane exercises the busy-state gate end-to-end against
+// a real tmux pane (capture-only, so it avoids the sendEnterVerified timing
+// flakiness of the full nudge integration tests). It confirms the wiring: when
+// the pane shows the "esc to interrupt" busy indicator, shouldSendEscape returns
+// false so a nudge will not interrupt the agent's in-flight work.
+func TestShouldSendEscape_LivePane(t *testing.T) {
+	tm := newTestTmux(t)
+	session := "gt-test-should-escape-" + t.Name()
+
+	_ = tm.KillSession(session)
+	if err := tm.NewSession(session, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(session) }()
+
+	// Idle shell prompt: no busy indicator → Escape is safe to send.
+	if !tm.shouldSendEscape(session) {
+		out, _ := tm.CapturePane(session, 20)
+		t.Fatalf("shouldSendEscape on idle pane = false, want true; pane:\n%s", out)
+	}
+
+	// Simulate an agent that is actively generating by rendering the busy
+	// indicator into the pane. The typed command line itself contains the
+	// marker, so detection does not depend on the command actually executing.
+	if err := tm.SendKeys(session, "echo esc to interrupt"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+
+	// Poll until the gate flips to suppressed (the shell may be slow to render).
+	deadline := time.Now().Add(5 * time.Second)
+	for tm.shouldSendEscape(session) {
+		if time.Now().After(deadline) {
+			out, _ := tm.CapturePane(session, 20)
+			t.Fatalf("shouldSendEscape did not detect busy indicator within timeout; pane:\n%s", out)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func TestShouldSendEscape_CaptureErrorSuppressesEscape(t *testing.T) {
+	tm := newTestTmux(t)
+
+	if tm.shouldSendEscape("missing-session-for-escape-check") {
+		t.Fatal("shouldSendEscape on missing target = true, want false")
+	}
+}
+
+// TestBusyIndicators pins the centralized busy-indicator source of truth so a
+// change to the upstream-coupled status string is intentional and reviewed
+// rather than accidental (gastownhall/gastown#4240).
+func TestBusyIndicators(t *testing.T) {
+	t.Parallel()
+
+	if len(busyIndicators) == 0 {
+		t.Fatal("busyIndicators must not be empty — busy/idle detection would silently break")
+	}
+
+	// "esc to interrupt" is the marker Claude Code / Codex / Gemini render while
+	// generating. If this assertion fails, the change must be deliberate.
+	found := false
+	for _, m := range busyIndicators {
+		if m == "esc to interrupt" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("busyIndicators = %q, want it to contain the known \"esc to interrupt\" marker", busyIndicators)
+	}
+
+	// Every marker must be matched by hasBusyIndicator (guards against an empty
+	// or whitespace-only entry slipping in).
+	for _, m := range busyIndicators {
+		if strings.TrimSpace(m) == "" {
+			t.Fatal("busyIndicators must not contain empty or whitespace-only markers")
+		}
+		if !hasBusyIndicator("⏵⏵ status · " + m) {
+			t.Errorf("hasBusyIndicator did not match a registered busy indicator %q", m)
+		}
 	}
 }
 
@@ -2093,6 +2742,38 @@ func TestSessionPrefixPattern_WithTownRoot(t *testing.T) {
 	// Verify it's a sorted alternation.
 	if !strings.HasPrefix(pattern, "^(") || !strings.HasSuffix(pattern, ")-") {
 		t.Errorf("pattern %q has unexpected format", pattern)
+	}
+}
+
+func TestSessionPrefixPattern_FallsBackToGTTownRoot(t *testing.T) {
+	// When GT_ROOT is empty but GT_TOWN_ROOT is set, sessionPrefixPattern
+	// should use GT_TOWN_ROOT to discover rig prefixes.
+	townRoot := os.Getenv("GT_ROOT")
+	if townRoot == "" {
+		townRoot = os.Getenv("GT_TOWN_ROOT")
+	}
+	if townRoot == "" {
+		t.Skip("neither GT_ROOT nor GT_TOWN_ROOT set; skipping")
+	}
+
+	// Clear GT_ROOT, set GT_TOWN_ROOT — simulates daemon startup env.
+	t.Setenv("GT_ROOT", "")
+	t.Setenv("GT_TOWN_ROOT", townRoot)
+
+	pattern := sessionPrefixPattern()
+	if !strings.Contains(pattern, "gt") {
+		t.Errorf("pattern %q missing 'gt'", pattern)
+	}
+	if !strings.Contains(pattern, "hq") {
+		t.Errorf("pattern %q missing 'hq'", pattern)
+	}
+	// With a real rigs.json via GT_TOWN_ROOT, we expect more than just gt+hq.
+	// At minimum there should be 3+ prefixes in a multi-rig town.
+	inner := strings.TrimPrefix(pattern, "^(")
+	inner = strings.TrimSuffix(inner, ")-")
+	prefixes := strings.Split(inner, "|")
+	if len(prefixes) < 3 {
+		t.Errorf("expected at least 3 prefixes via GT_TOWN_ROOT fallback, got %d: %v", len(prefixes), prefixes)
 	}
 }
 

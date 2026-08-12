@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -209,6 +208,18 @@ func runHookClear(cmd *cobra.Command, args []string) error {
 
 func runHook(_ *cobra.Command, args []string) error {
 	beadID := args[0]
+	if err := ensureCurrentHookWorktreeIntegrity(); err != nil {
+		return err
+	}
+
+	// Reject non-bead-shaped first args before passing to bd show, which would
+	// emit a confusing "bead 'set' not found" error. cobra has already failed to
+	// match against a registered subcommand, so anything reaching here that
+	// doesn't look like a bead ID is almost certainly a typo'd subcommand.
+	// See GH#3701.
+	if !isBeadID(beadID) {
+		return fmt.Errorf("%q is not a bead ID. See 'gt hook --help' for available subcommands and usage", beadID)
+	}
 
 	// Parse optional target agent
 	var targetAgent string
@@ -311,15 +322,7 @@ func runHook(_ *cobra.Command, args []string) error {
 			fmt.Printf("%s Replacing completed bead %s...\n", style.Dim.Render("ℹ"), existing.ID)
 			if !hookDryRun {
 				if hasAttachment {
-					// Close completed molecule bead (use bd close --force for pinned)
-					closeArgs := []string{"close", existing.ID, "--force",
-						"--reason=Auto-replaced by gt hook (molecule complete)"}
-					if sessionID := runtime.SessionIDFromEnv(); sessionID != "" {
-						closeArgs = append(closeArgs, "--session="+sessionID)
-					}
-					closeCmd := exec.Command("bd", closeArgs...)
-					closeCmd.Stderr = os.Stderr
-					if err := closeCmd.Run(); err != nil {
+					if err := closeCompletedHookedMolecule(workDir, existing.ID); err != nil {
 						return fmt.Errorf("closing completed bead %s: %w", existing.ID, err)
 					}
 				} else {
@@ -375,7 +378,8 @@ func runHook(_ *cobra.Command, args []string) error {
 	var lastHookErr error
 	for attempt := 1; attempt <= hookMaxRetries; attempt++ {
 		if err := BdCmd("update", beadID, "--status=hooked", "--assignee="+agentID).
-			Dir(townRoot).
+			Dir(resolveBeadDir(beadID)).
+			StripBeadsDir().
 			WithAutoCommit().
 			Run(); err != nil {
 			lastHookErr = err
@@ -429,6 +433,14 @@ func runHook(_ *cobra.Command, args []string) error {
 	return nil
 }
 
+func closeCompletedHookedMolecule(workDir, beadID string) error {
+	closeArgs := []string{"close", beadID, "--force", "--reason=Auto-replaced by gt hook (molecule complete)"}
+	if sessionID := runtime.SessionIDFromEnv(); sessionID != "" {
+		closeArgs = append(closeArgs, "--session="+sessionID)
+	}
+	return BdCmd(closeArgs...).Dir(workDir).WithAutoCommit().Run()
+}
+
 // checkPinnedBeadComplete checks if a pinned bead's attached molecule is 100% complete.
 // Returns (isComplete, hasAttachment):
 // - isComplete=true if no molecule attached OR all molecule steps are closed
@@ -458,6 +470,10 @@ func checkPinnedBeadComplete(b *beads.Beads, issue *beads.Issue) (isComplete boo
 
 // runHookShow displays another agent's hook in compact one-line format.
 func runHookShow(cmd *cobra.Command, args []string) error {
+	if err := ensureCurrentHookWorktreeIntegrity(); err != nil {
+		return err
+	}
+
 	var target string
 	if len(args) > 0 {
 		target = normalizeHookShowTarget(args[0])
@@ -479,32 +495,17 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("not in a beads workspace: %w", err)
 	}
-	if len(args) > 0 && !isTownLevelRole(target) {
+	if len(args) > 0 {
 		townRoot, townErr := workspace.FindFromCwd()
 		if townErr == nil && townRoot != "" {
-			agentBeadID := agentIDToBeadID(target, townRoot)
-			if agentBeadID != "" {
-				rigName := strings.Split(target, "/")[0]
-				var fallbackPath string
-				if rigName == "mayor" || rigName == "deacon" {
-					fallbackPath = townRoot
-				} else {
-					fallbackPath = filepath.Join(townRoot, rigName, "mayor", "rig")
-				}
-				workDir = beads.ResolveHookDir(townRoot, agentBeadID, fallbackPath)
-			}
+			workDir = resolveHookLookupWorkDir(workDir, target, townRoot)
 		}
 	}
 
 	b := beads.New(workDir)
-	// Query for hooked beads assigned to the target
-	hookedBeads, err := b.List(beads.ListOptions{
-		Status:   beads.StatusHooked,
-		Assignee: target,
-		Priority: -1,
-	})
+	hookedBeads, err := listAssignedActiveWork(b, target)
 	if err != nil {
-		return fmt.Errorf("listing hooked beads: %w", err)
+		return fmt.Errorf("listing active hook work: %w", err)
 	}
 
 	// If nothing found in local beads, also check town beads for hooked convoys.
@@ -517,13 +518,8 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 			townBeadsDir := filepath.Join(townRoot, ".beads")
 			if _, err := os.Stat(townBeadsDir); err == nil {
 				townBeads := beads.New(townBeadsDir)
-				townHooked, err := townBeads.List(beads.ListOptions{
-					Status:   beads.StatusHooked,
-					Assignee: target,
-					Priority: -1,
-				})
-				if err == nil && len(townHooked) > 0 {
-					hookedBeads = townHooked
+				if townWork, err := listAssignedActiveWork(townBeads, target); err == nil && len(townWork) > 0 {
+					hookedBeads = townWork
 				}
 			}
 
@@ -565,6 +561,19 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func ensureCurrentHookWorktreeIntegrity() error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getting current directory: %w", err)
+	}
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil || townRoot == "" {
+		return nil
+	}
+	roleCtx := detectRole(cwd, townRoot)
+	return ensureRoleWorktreeIntegrity(cwd, townRoot, roleCtx.Role)
+}
+
 // normalizeHookShowTarget resolves target aliases/shorthand to canonical agent IDs.
 // Examples:
 //   - "rig/polecat" -> "rig/polecats/polecat"
@@ -574,6 +583,9 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 func normalizeHookShowTarget(target string) string {
 	target = strings.TrimSpace(target)
 	if target == "" {
+		return target
+	}
+	if target == "." || target == ".." || (strings.ContainsAny(target, `/\\`) && !safeAgentTargetPath(target)) {
 		return target
 	}
 
@@ -595,7 +607,7 @@ func normalizeHookShowTarget(target string) string {
 	// This handles the case where the session name roundtrip fails due to
 	// uninitialized prefix registry. See GH#2371.
 	parts := strings.Split(target, "/")
-	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+	if len(parts) == 2 && safeAgentPathSegment(parts[0]) && safeAgentPathSegment(parts[1]) {
 		name := parts[1]
 		// Check for known roles — don't expand those
 		switch strings.ToLower(name) {
@@ -626,7 +638,7 @@ func normalizeHookShowTarget(target string) string {
 // environments where the global session registry is not initialized.
 func sessionNameToCanonicalAddress(sessionName, targetHint string) (string, bool) {
 	if identity, err := session.ParseSessionName(sessionName); err == nil {
-		return identity.Address(), true
+		return canonicalAssigneeAddress(identity), true
 	}
 
 	registry := session.NewPrefixRegistry()
@@ -643,7 +655,7 @@ func sessionNameToCanonicalAddress(sessionName, targetHint string) (string, bool
 	if err != nil {
 		return "", false
 	}
-	return identity.Address(), true
+	return canonicalAssigneeAddress(identity), true
 }
 
 // findTownRoot finds the Gas Town root directory.

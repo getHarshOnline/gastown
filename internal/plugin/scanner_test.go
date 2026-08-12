@@ -80,6 +80,28 @@ These are the instructions.
 	}
 }
 
+func TestDoltShellPluginsPreferGTDoltEnv(t *testing.T) {
+	root := filepath.Join("..", "..")
+	for _, rel := range []string{
+		filepath.Join("plugins", "compactor-dog", "run.sh"),
+		filepath.Join("plugins", "dolt-archive", "run.sh"),
+	} {
+		data, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		content := string(data)
+		for _, want := range []string{
+			`DOLT_HOST="${GT_DOLT_HOST:-${DOLT_HOST:-127.0.0.1}}"`,
+			`DOLT_PORT="${GT_DOLT_PORT:-${DOLT_PORT:-3307}}"`,
+		} {
+			if !strings.Contains(content, want) {
+				t.Fatalf("%s missing %q", rel, want)
+			}
+		}
+	}
+}
+
 func TestParsePluginMD_MissingName(t *testing.T) {
 	content := []byte(`+++
 description = "No name"
@@ -377,8 +399,8 @@ func TestParsePluginMD_GitHubSheriff(t *testing.T) {
 	if plugin.Gate.Type != GateCooldown {
 		t.Errorf("expected gate type 'cooldown', got %q", plugin.Gate.Type)
 	}
-	if plugin.Gate.Duration != "5m" {
-		t.Errorf("expected gate duration '5m', got %q", plugin.Gate.Duration)
+	if plugin.Gate.Duration != "2h" {
+		t.Errorf("expected gate duration '2h', got %q", plugin.Gate.Duration)
 	}
 	if plugin.Tracking == nil {
 		t.Fatal("expected tracking to be non-nil")
@@ -400,14 +422,56 @@ func TestParsePluginMD_GitHubSheriff(t *testing.T) {
 	}
 }
 
-func TestParsePluginMD_SessionHygiene(t *testing.T) {
+func TestParsePluginMD_StuckAgentDogUsesCanonicalHeartbeatPath(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", "plugins", "stuck-agent-dog", "plugin.md"))
+	if err != nil {
+		t.Skipf("stuck-agent-dog plugin not found (expected in plugins/): %v", err)
+	}
+
+	plugin, err := parsePluginMD(content, "/test/stuck-agent-dog", LocationRig, "gastown")
+	if err != nil {
+		t.Fatalf("parsePluginMD failed: %v", err)
+	}
+
+	if plugin.Name != "stuck-agent-dog" {
+		t.Fatalf("expected name 'stuck-agent-dog', got %q", plugin.Name)
+	}
+	if !strings.Contains(plugin.Instructions, "deacon/heartbeat.json") {
+		t.Fatalf("expected canonical heartbeat path in instructions, got:\n%s", plugin.Instructions)
+	}
+	if strings.Contains(plugin.Instructions, ".deacon-heartbeat") {
+		t.Fatalf("did not expect legacy heartbeat path in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, "gt rig list --json unavailable; cannot verify operational rig state") {
+		t.Fatalf("expected fail-closed rig-list guidance in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, "gt rig list --json not parseable; cannot verify operational rig state") {
+		t.Fatalf("expected fail-closed rig-list parse guidance in instructions, got:\n%s", plugin.Instructions)
+	}
+	for _, legacy := range []string{"RIGS_JSON_PATH", "$TOWN_ROOT/mayor/rigs.json", "could not parse rigs.json"} {
+		if strings.Contains(plugin.Instructions, legacy) {
+			t.Fatalf("did not expect legacy rigs.json guidance %q in instructions, got:\n%s", legacy, plugin.Instructions)
+		}
+	}
+	if !strings.Contains(plugin.Instructions, "Filter out any malformed/blank rows") {
+		t.Fatalf("expected fail-safe blank/malformed rigs row handling in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, "GT_STUCK_AGENT_DOG_DEACON_STALE_SECONDS") {
+		t.Fatalf("expected configurable deacon stale threshold in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, "heartbeat_write_divergence") {
+		t.Fatalf("expected heartbeat write-divergence handling in instructions, got:\n%s", plugin.Instructions)
+	}
+}
+
+func TestParsePluginMD_WithRunScript(t *testing.T) {
 	// Use a temp dir with a fixture plugin.md and run.sh so the test
 	// doesn't depend on the local filesystem layout (fails in CI).
 	pluginDir := t.TempDir()
 
 	pluginContent := []byte(`+++
-name = "session-hygiene"
-description = "Clean up zombie tmux sessions and orphaned dog sessions"
+name = "example-plugin"
+description = "Example plugin with run script and all features"
 version = 2
 
 [gate]
@@ -415,7 +479,7 @@ type = "cooldown"
 duration = "30m"
 
 [tracking]
-labels = ["plugin:session-hygiene", "category:cleanup"]
+labels = ["plugin:example-plugin", "category:cleanup"]
 digest = true
 
 [execution]
@@ -424,9 +488,9 @@ notify_on_failure = true
 severity = "low"
 +++
 
-# Session Hygiene
+# Example Plugin
 
-Deterministic cleanup of zombie tmux sessions and orphaned dog sessions.
+Deterministic cleanup plugin with run.sh script.
 `)
 
 	if err := os.WriteFile(filepath.Join(pluginDir, "plugin.md"), pluginContent, 0644); err != nil {
@@ -452,11 +516,11 @@ Deterministic cleanup of zombie tmux sessions and orphaned dog sessions.
 		plugin.HasRunScript = true
 	}
 	if !plugin.HasRunScript {
-		t.Error("expected HasRunScript=true for session-hygiene (has run.sh)")
+		t.Error("expected HasRunScript=true for plugin with run.sh")
 	}
 
-	if plugin.Name != "session-hygiene" {
-		t.Errorf("expected name 'session-hygiene', got %q", plugin.Name)
+	if plugin.Name != "example-plugin" {
+		t.Errorf("expected name 'example-plugin', got %q", plugin.Name)
 	}
 	if plugin.Gate == nil {
 		t.Fatal("expected gate to be non-nil")
@@ -644,6 +708,12 @@ func TestFormatMailBody_WithRunScript(t *testing.T) {
 	if !strings.Contains(body, "Do NOT interpret the plugin.md instructions") {
 		t.Error("expected mail body to warn against interpreting markdown")
 	}
+	if !strings.Contains(body, "gt plugin record-run --plugin test-plugin --result <outcome>") {
+		t.Error("expected mail body to use canonical plugin run recorder")
+	}
+	if strings.Contains(body, "bd create --ephemeral") {
+		t.Error("expected mail body to avoid raw ephemeral receipt creation")
+	}
 	// Must NOT contain "## Instructions" section
 	if strings.Contains(body, "## Instructions") {
 		t.Error("expected mail body to NOT contain markdown instructions section")
@@ -822,5 +892,11 @@ func TestFormatMailBody_WithoutRunScript(t *testing.T) {
 	// Must NOT contain run.sh dispatch
 	if strings.Contains(body, "bash run.sh") {
 		t.Error("expected mail body to NOT contain run.sh command")
+	}
+	if !strings.Contains(body, "gt plugin record-run --plugin test-plugin --result <outcome>") {
+		t.Error("expected mail body to use canonical plugin run recorder")
+	}
+	if strings.Contains(body, "bd create --ephemeral") {
+		t.Error("expected mail body to avoid raw ephemeral receipt creation")
 	}
 }

@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -24,10 +22,12 @@ const (
 
 // PluginRunRecord represents data for creating a plugin run bead.
 type PluginRunRecord struct {
-	PluginName string
-	RigName    string
-	Result     RunResult
-	Body       string
+	PluginName  string
+	RigName     string
+	Result      RunResult
+	Title       string
+	Body        string
+	ExtraLabels []string
 }
 
 // PluginRunBead represents a recorded plugin run from the ledger.
@@ -52,7 +52,10 @@ func NewRecorder(townRoot string) *Recorder {
 // RecordRun creates an ephemeral bead for a plugin run.
 // This is pure data writing - the caller decides what result to record.
 func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
-	title := fmt.Sprintf("Plugin run: %s", record.PluginName)
+	title := record.Title
+	if title == "" {
+		title = fmt.Sprintf("Plugin run: %s", record.PluginName)
+	}
 
 	// Build labels
 	labels := []string{
@@ -63,12 +66,14 @@ func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
 	if record.RigName != "" {
 		labels = append(labels, fmt.Sprintf("rig:%s", record.RigName))
 	}
+	labels = append(labels, record.ExtraLabels...)
 
 	// Build bd create command
 	args := []string{
 		"create",
 		"--ephemeral",
 		"--json",
+		"-t", "chore",
 		"--title=" + title,
 	}
 	for _, label := range labels {
@@ -80,11 +85,8 @@ func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
-	cmd.Dir = r.townRoot
-	// Set BEADS_DIR explicitly to prevent inherited env vars from causing
-	// prefix mismatches when redirects are in play.
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beads.ResolveBeadsDir(r.townRoot))
+	townBeads := beads.ResolveBeadsDir(r.townRoot)
+	cmd := beads.CommandContext(ctx, r.townRoot, townBeads, beads.MutationPinned, args...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -101,6 +103,13 @@ func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		return "", fmt.Errorf("parsing bd create output: %w", err)
 	}
+
+	// Close the receipt immediately — it exists for audit/cooldown-gate queries
+	// (which use --all to include closed beads) but should not stay open.
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
+	defer closeCancel()
+	closeCmd := beads.CommandContext(closeCtx, r.townRoot, townBeads, beads.MutationPinned, "close", result.ID, "--reason", "plugin run recorded")
+	_ = closeCmd.Run() // Best-effort — reaper will catch it if this fails
 
 	return result.ID, nil
 }
@@ -148,14 +157,11 @@ func (r *Recorder) queryRuns(pluginName string, limit int, since string) ([]*Plu
 		cutoff := time.Now().Add(-d).UTC().Format(time.RFC3339)
 		args = append(args, "--created-after="+cutoff)
 	}
+	args = beads.InjectFlatForListJSON(args)
 
 	ctx, cancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
-	cmd.Dir = r.townRoot
-	// Set BEADS_DIR explicitly to prevent inherited env vars from causing
-	// prefix mismatches when redirects are in play.
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beads.ResolveBeadsDir(r.townRoot))
+	cmd := beads.CommandContext(ctx, r.townRoot, beads.ResolveBeadsDir(r.townRoot), beads.ReadOnlyPinned, args...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

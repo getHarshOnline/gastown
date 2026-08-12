@@ -13,29 +13,6 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 )
 
-func captureStdout(t *testing.T, fn func()) string {
-	t.Helper()
-	old := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("create pipe: %v", err)
-	}
-	os.Stdout = w
-
-	fn()
-
-	_ = w.Close()
-	os.Stdout = old
-
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, r); err != nil {
-		t.Fatalf("read stdout: %v", err)
-	}
-	_ = r.Close()
-
-	return buf.String()
-}
-
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()
 	old := os.Stderr
@@ -291,6 +268,28 @@ func TestRunStatusWatch_RejectsJSONCombo(t *testing.T) {
 	if !strings.Contains(err.Error(), "cannot be used together") {
 		t.Errorf("error %q should mention 'cannot be used together'", err.Error())
 	}
+}
+
+func TestTryStatusDetailLockContention(t *testing.T) {
+	townRoot := t.TempDir()
+
+	release, ok := tryStatusDetailLock(townRoot)
+	if !ok {
+		t.Fatal("first status detail lock should be acquired")
+	}
+
+	if release2, ok := tryStatusDetailLock(townRoot); ok {
+		release2()
+		t.Fatal("second status detail lock should fail while first is held")
+	}
+
+	release()
+
+	release3, ok := tryStatusDetailLock(townRoot)
+	if !ok {
+		t.Fatal("status detail lock should be reusable after release")
+	}
+	release3()
 }
 
 func TestIsKnownAgent(t *testing.T) {

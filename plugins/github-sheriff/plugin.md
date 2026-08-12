@@ -5,7 +5,7 @@ version = 1
 
 [gate]
 type = "cooldown"
-duration = "5m"
+duration = "2h"
 
 [tracking]
 labels = ["plugin:github-sheriff", "category:ci-monitoring"]
@@ -63,9 +63,10 @@ Fetch all open PRs in a single GraphQL call via `gh`. This returns additions,
 deletions, mergeable status, and CI check results without per-PR API overhead:
 
 ```bash
+SINCE=$(date -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -v-7d +%Y-%m-%dT%H:%M:%SZ)
 PRS=$(gh pr list --repo "$REPO" --state open \
-  --json number,title,author,additions,deletions,mergeable,statusCheckRollup,url \
-  --limit 100)
+  --json number,title,author,additions,deletions,mergeable,statusCheckRollup,url,updatedAt \
+  --limit 100 | jq --arg since "$SINCE" '[.[] | select(.updatedAt >= $since)]')
 
 PR_COUNT=$(echo "$PRS" | jq length)
 if [ "$PR_COUNT" -eq 0 ]; then
@@ -142,66 +143,24 @@ if [ ${#NEEDS_REVIEW[@]} -gt 0 ]; then
 fi
 ```
 
-### Step 3: Deduplicate CI failures against existing beads
-
-For each failure, check if a bead already exists:
-
-```bash
-EXISTING=$(bd list --label ci-failure --status open --json 2>/dev/null || echo "[]")
-
-CREATED=0
-SKIPPED=0
-
-for F in "${FAILURES[@]}"; do
-  IFS='|' read -r PR_NUM PR_TITLE CHECK_NAME CHECK_URL <<< "$F"
-  BEAD_TITLE="CI failure: $CHECK_NAME on PR #$PR_NUM"
-
-  # Check for duplicate (use jq --arg for safe string comparison)
-  if echo "$EXISTING" | jq -e --arg t "$BEAD_TITLE" '.[] | select(.title == $t)' > /dev/null 2>&1; then
-    SKIPPED=$((SKIPPED + 1))
-    continue
-  fi
-
-  DESCRIPTION="CI check \`$CHECK_NAME\` failed on PR #$PR_NUM ($PR_TITLE)
-
-PR: https://github.com/$REPO/pull/$PR_NUM"
-  [ -n "$CHECK_URL" ] && DESCRIPTION="$DESCRIPTION
-Check: $CHECK_URL"
-
-  BEAD_ID=$(bd create "$BEAD_TITLE" -t task -p 2 \
-    -d "$DESCRIPTION" \
-    -l ci-failure \
-    --json 2>/dev/null | jq -r '.id // empty')
-
-  if [ -n "$BEAD_ID" ]; then
-    CREATED=$((CREATED + 1))
-
-    gt activity emit github_check_failed \
-      --message "CI check $CHECK_NAME failed on PR #$PR_NUM ($REPO), bead $BEAD_ID" \
-      2>/dev/null || true
-  fi
-done
-```
-
 ## Record Result
 
 ```bash
-SUMMARY="$REPO: $PR_COUNT PRs — ${#EASY_WINS[@]} easy win(s), ${#NEEDS_REVIEW[@]} need review, ${#FAILURES[@]} failure(s), $CREATED bead(s) created, $SKIPPED already tracked"
+SUMMARY="$REPO: $PR_COUNT PRs — ${#EASY_WINS[@]} easy win(s), ${#NEEDS_REVIEW[@]} need review, ${#FAILURES[@]} CI failure(s) detected"
 echo "$SUMMARY"
 ```
 
 On success:
 ```bash
-bd create "github-sheriff: $SUMMARY" -t chore --ephemeral \
-  -l type:plugin-run,plugin:github-sheriff,result:success \
-  -d "$SUMMARY" --silent 2>/dev/null || true
+gt plugin record-run --plugin github-sheriff --result success \
+  --title "github-sheriff: $SUMMARY" --description "$SUMMARY" >/dev/null 2>&1 || true
 ```
 
 On failure:
 ```bash
-bd create "github-sheriff: FAILED" -t chore --ephemeral \
-  -l type:plugin-run,plugin:github-sheriff,result:failure \
-  -d "GitHub sheriff failed: $ERROR" --silent 2>/dev/null || true
+gt plugin record-run --plugin github-sheriff --result failure \
+  --title "github-sheriff: FAILED" \
+  --description "GitHub sheriff failed: $ERROR" >/dev/null 2>&1 || true
 
 gt escalate "Plugin FAILED: github-sheriff" \
   --severity low \

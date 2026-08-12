@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -16,10 +17,22 @@ func isClaudeCmd(cmd string) bool {
 	return base == "claude"
 }
 
+func TestBuiltInAgentPresetSummary(t *testing.T) {
+	t.Parallel()
+	s := BuiltInAgentPresetSummary()
+	if !strings.Contains(s, "cursor") || !strings.Contains(s, "claude") {
+		t.Fatalf("BuiltInAgentPresetSummary() = %q, want cursor and claude", s)
+	}
+	names := strings.Split(s, ", ")
+	if !sort.StringsAreSorted(names) {
+		t.Errorf("BuiltInAgentPresetSummary not sorted: %q", s)
+	}
+}
+
 func TestBuiltinPresets(t *testing.T) {
 	t.Parallel()
 	// Ensure all built-in presets are accessible
-	presets := []AgentPreset{AgentClaude, AgentGemini, AgentCodex, AgentCursor, AgentAuggie, AgentAmp, AgentOpenCode, AgentCopilot, AgentPi, AgentOmp}
+	presets := []AgentPreset{AgentClaude, AgentGemini, AgentCodex, AgentKiro, AgentCursor, AgentAuggie, AgentAmp, AgentOpenCode, AgentCopilot, AgentPi, AgentOmp}
 
 	for _, preset := range presets {
 		info := GetAgentPreset(preset)
@@ -49,6 +62,7 @@ func TestGetAgentPresetByName(t *testing.T) {
 		{"claude", AgentClaude, false},
 		{"gemini", AgentGemini, false},
 		{"codex", AgentCodex, false},
+		{"kiro", AgentKiro, false},
 		{"cursor", AgentCursor, false},
 		{"auggie", AgentAuggie, false},
 		{"amp", AgentAmp, false},
@@ -85,6 +99,7 @@ func TestRuntimeConfigFromPreset(t *testing.T) {
 		{AgentClaude, "claude"}, // Note: claude may resolve to full path
 		{AgentGemini, "gemini"},
 		{AgentCodex, "codex"},
+		{AgentKiro, "kiro-cli"},
 		{AgentCursor, "cursor-agent"},
 		{AgentAuggie, "auggie"},
 		{AgentAmp, "amp"},
@@ -298,6 +313,12 @@ func TestResolveProcessNames(t *testing.T) {
 			want:      []string{"codex"},
 		},
 		{
+			name:      "built-in preset through gt wrapper command",
+			agentName: "codex",
+			command:   "gt-codex",
+			want:      []string{"codex"},
+		},
+		{
 			name:      "unknown agent with known command",
 			agentName: "my-custom-agent",
 			command:   "claude",
@@ -396,6 +417,116 @@ func TestResolveProcessNames(t *testing.T) {
 		want := []string{"special-binary", "helper"}
 		if len(got) != len(want) {
 			t.Fatalf("ResolveProcessNames command-based lookup with abs-path = %v, want %v", got, want)
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Errorf("got[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	// Regression: custom agents wrapped in `env -u VAR <real-binary>` (or
+	// nohup/sudo/etc.) used to fall through to GT_PROCESS_NAMES=<wrapper>,
+	// which IsAgentAlive could never match — wrapper has exec'd into the real
+	// binary by then. ResolveProcessNames must look past the wrapper.
+	wrapperCases := []struct {
+		name    string
+		agent   AgentPresetInfo
+		want    []string
+		command string // command passed to ResolveProcessNames
+	}{
+		{
+			name: "env -u VAR claude unwraps to claude preset",
+			agent: AgentPresetInfo{
+				Name:    "claude",
+				Command: "env",
+				Args:    []string{"-u", "ANTHROPIC_API_KEY", "claude", "--dangerously-skip-permissions", "--effort", "high"},
+			},
+			command: "env",
+			want:    []string{"node", "claude"},
+		},
+		{
+			name: "env VAR=val claude unwraps past assignments",
+			agent: AgentPresetInfo{
+				Name:    "claude",
+				Command: "env",
+				Args:    []string{"FOO=bar", "BAZ=qux", "claude"},
+			},
+			command: "env",
+			want:    []string{"node", "claude"},
+		},
+		{
+			name: "env -- claude (separator) unwraps to claude",
+			agent: AgentPresetInfo{
+				Name:    "claude",
+				Command: "env",
+				Args:    []string{"-i", "--", "claude", "--foo"},
+			},
+			command: "env",
+			want:    []string{"node", "claude"},
+		},
+		{
+			name: "nohup opencode unwraps to opencode preset",
+			agent: AgentPresetInfo{
+				Name:    "opencode",
+				Command: "nohup",
+				Args:    []string{"opencode", "--quiet"},
+			},
+			command: "nohup",
+			want:    []string{"opencode", "node", "bun"},
+		},
+		{
+			name: "sudo -u runner codex unwraps to codex preset",
+			agent: AgentPresetInfo{
+				Name:    "codex",
+				Command: "sudo",
+				Args:    []string{"-u", "runner", "codex", "--dangerously-bypass-approvals-and-sandbox"},
+			},
+			command: "sudo",
+			want:    []string{"codex"},
+		},
+		{
+			name: "env wrapping unknown binary returns binary basename",
+			agent: AgentPresetInfo{
+				Name:    "my-agent",
+				Command: "env",
+				Args:    []string{"-u", "FOO", "/opt/my-tool", "--flag"},
+			},
+			command: "env",
+			want:    []string{"my-tool"},
+		},
+	}
+	for _, tc := range wrapperCases {
+		t.Run(tc.name, func(t *testing.T) {
+			RegisterAgentForTesting(string(tc.agent.Name), tc.agent)
+			t.Cleanup(ResetRegistryForTesting)
+
+			got := ResolveProcessNames(string(tc.agent.Name), tc.command, tc.agent.Args...)
+			if len(got) != len(tc.want) {
+				t.Fatalf("ResolveProcessNames(%q, %q) = %v, want %v", tc.agent.Name, tc.command, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("got[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+
+	// Real-world scenario: Paul's town settings shadow the canonical claude
+	// preset with a wrapper. The registry still holds the built-in claude
+	// preset; Args live only on the caller's RuntimeConfig. Caller args must
+	// take precedence so wrapper-unwrap finds the real binary.
+	t.Run("caller args used when registry holds canonical preset", func(t *testing.T) {
+		ResetRegistryForTesting()
+		t.Cleanup(ResetRegistryForTesting)
+		// No RegisterAgentForTesting — registry has canonical built-in claude
+		// (Command="claude", ProcessNames=[node, claude], Args=[--dangerously-...]).
+		got := ResolveProcessNames("claude", "env",
+			"-u", "ANTHROPIC_API_KEY", "claude", "--dangerously-skip-permissions", "--effort", "high")
+		want := []string{"node", "claude"}
+		if len(got) != len(want) {
+			t.Fatalf("got %v, want %v", got, want)
 		}
 		for i := range got {
 			if got[i] != want[i] {
@@ -505,6 +636,13 @@ func TestBuildResumeCommand(t *testing.T) {
 			contains:  []string{"codex", "resume", "codex-sess-789", "--dangerously-bypass-approvals-and-sandbox"},
 		},
 		{
+			name:      "kiro flag style",
+			agentName: "kiro",
+			sessionID: "f2946a26-3735-4b08-8d05-c928010302d5",
+			wantEmpty: false,
+			contains:  []string{"kiro-cli", "chat", "--trust-all-tools", "--resume-id", "f2946a26-3735-4b08-8d05-c928010302d5"},
+		},
+		{
 			name:      "empty session ID",
 			agentName: "claude",
 			sessionID: "",
@@ -554,6 +692,7 @@ func TestSupportsSessionResume(t *testing.T) {
 		{"claude", true},
 		{"gemini", true},
 		{"codex", true},
+		{"kiro", true},
 		{"cursor", true},
 		{"auggie", true},
 		{"amp", true},
@@ -579,6 +718,7 @@ func TestGetSessionIDEnvVar(t *testing.T) {
 		{"claude", "CLAUDE_SESSION_ID"},
 		{"gemini", "GEMINI_SESSION_ID"},
 		{"codex", ""},   // Codex uses JSONL output instead
+		{"kiro", ""},    // Kiro stores sessions per directory and resumes by CLI flag
 		{"cursor", ""},  // Cursor uses --resume with chatId directly
 		{"auggie", ""},  // Auggie uses --resume directly
 		{"amp", ""},     // AMP uses 'threads continue' subcommand
@@ -604,7 +744,8 @@ func TestGetProcessNames(t *testing.T) {
 		{"claude", []string{"node", "claude"}},
 		{"gemini", []string{"gemini"}},
 		{"codex", []string{"codex"}},
-		{"cursor", []string{"cursor-agent"}},
+		{"kiro", []string{"kiro-cli"}},
+		{"cursor", []string{"cursor-agent", "agent"}},
 		{"auggie", []string{"auggie"}},
 		{"amp", []string{"amp"}},
 		{"opencode", []string{"opencode", "node", "bun"}},
@@ -748,8 +889,7 @@ func TestCursorAgentPreset(t *testing.T) {
 		t.Errorf("cursor command = %q, want cursor-agent", info.Command)
 	}
 
-	// Check YOLO-equivalent flag (-f for force mode)
-	// Note: -p is for non-interactive mode with prompt, not used for default Args
+	// Check YOLO-equivalent flag (-f for force mode; CLI also documents --force / --yolo)
 	hasF := false
 	for _, arg := range info.Args {
 		if arg == "-f" {
@@ -760,12 +900,16 @@ func TestCursorAgentPreset(t *testing.T) {
 		t.Error("cursor args missing -f (force/YOLO mode)")
 	}
 
-	// Check ProcessNames for detection
-	if len(info.ProcessNames) == 0 {
-		t.Error("cursor ProcessNames is empty")
+	// Check ProcessNames for detection (install script provides both "agent" and "cursor-agent" symlinks).
+	// Tmux only treats "agent" as Cursor when GT_AGENT=cursor or GT_PROCESS_NAMES includes cursor-agent.
+	seen := make(map[string]bool, len(info.ProcessNames))
+	for _, n := range info.ProcessNames {
+		seen[n] = true
 	}
-	if info.ProcessNames[0] != "cursor-agent" {
-		t.Errorf("cursor ProcessNames[0] = %q, want cursor-agent", info.ProcessNames[0])
+	for _, name := range []string{"agent", "cursor-agent"} {
+		if !seen[name] {
+			t.Errorf("cursor ProcessNames missing %q (got %v)", name, info.ProcessNames)
+		}
 	}
 
 	// Check resume support
@@ -774,6 +918,62 @@ func TestCursorAgentPreset(t *testing.T) {
 	}
 	if info.ResumeStyle != "flag" {
 		t.Errorf("cursor ResumeStyle = %q, want flag", info.ResumeStyle)
+	}
+	if info.ReadyDelayMs != 5000 {
+		t.Errorf("cursor ReadyDelayMs = %d, want 5000 (nudge poller + WaitForRuntimeReady)", info.ReadyDelayMs)
+	}
+}
+
+func TestKiroAgentPreset(t *testing.T) {
+	t.Parallel()
+
+	info := GetAgentPreset(AgentKiro)
+	if info == nil {
+		t.Fatal("kiro preset not found")
+	}
+
+	if info.Command != "kiro-cli" {
+		t.Errorf("kiro Command = %q, want kiro-cli", info.Command)
+	}
+	wantArgs := []string{"chat", "--trust-all-tools"}
+	if len(info.Args) != len(wantArgs) {
+		t.Fatalf("kiro Args = %v, want %v", info.Args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if info.Args[i] != want {
+			t.Errorf("kiro Args[%d] = %q, want %q", i, info.Args[i], want)
+		}
+	}
+
+	if len(info.ProcessNames) != 1 || info.ProcessNames[0] != "kiro-cli" {
+		t.Errorf("kiro ProcessNames = %v, want [kiro-cli]", info.ProcessNames)
+	}
+	if info.SessionIDEnv != "" {
+		t.Errorf("kiro SessionIDEnv = %q, want empty", info.SessionIDEnv)
+	}
+	if info.ResumeFlag != "--resume-id" {
+		t.Errorf("kiro ResumeFlag = %q, want --resume-id", info.ResumeFlag)
+	}
+	if info.ContinueFlag != "--resume" {
+		t.Errorf("kiro ContinueFlag = %q, want --resume", info.ContinueFlag)
+	}
+	if info.ResumeStyle != "flag" {
+		t.Errorf("kiro ResumeStyle = %q, want flag", info.ResumeStyle)
+	}
+	if info.SupportsHooks {
+		t.Error("kiro SupportsHooks should remain false until Gas Town has a Kiro hook adapter")
+	}
+	if info.SupportsForkSession {
+		t.Error("kiro should not support fork session")
+	}
+	if info.NonInteractive != nil {
+		t.Errorf("kiro NonInteractive = %+v, want nil until --no-interactive positional prompts are modeled", info.NonInteractive)
+	}
+	if info.ReadyDelayMs != 5000 {
+		t.Errorf("kiro ReadyDelayMs = %d, want 5000", info.ReadyDelayMs)
+	}
+	if info.InstructionsFile != "AGENTS.md" {
+		t.Errorf("kiro InstructionsFile = %q, want AGENTS.md", info.InstructionsFile)
 	}
 }
 
@@ -847,6 +1047,21 @@ func TestLoadRigAgentRegistry(t *testing.T) {
 
 		if info.Command != "opencode" {
 			t.Errorf("expected opencode agent command to be 'opencode', got %s", info.Command)
+		}
+		if info.ConfigDir != ".opencode" {
+			t.Errorf("expected opencode ConfigDir to inherit '.opencode', got %q", info.ConfigDir)
+		}
+		if info.HooksDir != ".opencode/plugins" {
+			t.Errorf("expected opencode HooksDir to inherit '.opencode/plugins', got %q", info.HooksDir)
+		}
+		if info.HooksSettingsFile != "gastown.js" {
+			t.Errorf("expected opencode HooksSettingsFile to inherit 'gastown.js', got %q", info.HooksSettingsFile)
+		}
+		if len(info.ProcessNames) == 0 {
+			t.Errorf("expected opencode ProcessNames to remain populated after partial override")
+		}
+		if info.ReadyDelayMs != 8000 {
+			t.Errorf("expected opencode ReadyDelayMs to inherit 8000, got %d", info.ReadyDelayMs)
 		}
 	})
 
@@ -1035,6 +1250,9 @@ func TestCopilotAgentPreset(t *testing.T) {
 	if info.ResumeFlag != "--resume" {
 		t.Errorf("copilot ResumeFlag = %q, want --resume", info.ResumeFlag)
 	}
+	if info.ContinueFlag != "--continue" {
+		t.Errorf("copilot ContinueFlag = %q, want --continue", info.ContinueFlag)
+	}
 	if info.ResumeStyle != "flag" {
 		t.Errorf("copilot ResumeStyle = %q, want flag", info.ResumeStyle)
 	}
@@ -1045,6 +1263,16 @@ func TestCopilotAgentPreset(t *testing.T) {
 
 	if info.SupportsForkSession {
 		t.Error("copilot should not support fork session")
+	}
+
+	// GA: COPILOT_HOME overrides config directory
+	if info.ConfigDirEnv != "COPILOT_HOME" {
+		t.Errorf("copilot ConfigDirEnv = %q, want COPILOT_HOME", info.ConfigDirEnv)
+	}
+
+	// GA: no detectable prompt prefix — uses delay-based readiness
+	if info.ReadyPromptPrefix != "" {
+		t.Errorf("copilot ReadyPromptPrefix = %q, want empty (GA has no ❯ prompt)", info.ReadyPromptPrefix)
 	}
 
 	if info.NonInteractive == nil {
@@ -1125,8 +1353,8 @@ func TestCopilotProviderDefaults(t *testing.T) {
 	}
 
 	configEnv := defaultConfigDirEnv("copilot")
-	if configEnv != "" {
-		t.Errorf("defaultConfigDirEnv(copilot) = %q, want empty", configEnv)
+	if configEnv != "COPILOT_HOME" {
+		t.Errorf("defaultConfigDirEnv(copilot) = %q, want COPILOT_HOME", configEnv)
 	}
 
 	provider := defaultHooksProvider("copilot")
@@ -1157,8 +1385,8 @@ func TestCopilotProviderDefaults(t *testing.T) {
 	}
 
 	prefix := defaultReadyPromptPrefix("copilot")
-	if prefix != "❯ " {
-		t.Errorf("defaultReadyPromptPrefix(copilot) = %q, want \"❯ \"", prefix)
+	if prefix != "" {
+		t.Errorf("defaultReadyPromptPrefix(copilot) = %q, want empty (GA has no ❯ prompt)", prefix)
 	}
 
 	delay := defaultReadyDelayMs("copilot")
@@ -1192,6 +1420,31 @@ func TestCopilotRuntimeConfigFromPreset(t *testing.T) {
 	}
 }
 
+func TestCodexRuntimeConfigHasPromptDetection(t *testing.T) {
+	t.Parallel()
+
+	rc := RuntimeConfigFromPreset(AgentCodex)
+	if rc == nil {
+		t.Fatal("RuntimeConfigFromPreset(codex) returned nil")
+	}
+	if rc.Tmux == nil {
+		t.Fatal("RuntimeConfigFromPreset(codex).Tmux returned nil")
+	}
+	if rc.Tmux.ReadyPromptPrefix != "› " {
+		t.Errorf("RuntimeConfigFromPreset(codex).Tmux.ReadyPromptPrefix = %q, want %q", rc.Tmux.ReadyPromptPrefix, "› ")
+	}
+	if rc.PromptMode != "arg" {
+		t.Errorf("RuntimeConfigFromPreset(codex).PromptMode = %q, want arg", rc.PromptMode)
+	}
+	args := strings.Join(rc.Args, " ")
+	if !strings.Contains(args, codexUpdateCheckConfig) {
+		t.Errorf("RuntimeConfigFromPreset(codex).Args = %v, want %q", rc.Args, codexUpdateCheckConfig)
+	}
+	if !strings.Contains(args, "--dangerously-bypass-approvals-and-sandbox") {
+		t.Errorf("RuntimeConfigFromPreset(codex).Args = %v, want bypass flag", rc.Args)
+	}
+}
+
 func TestPiProviderDefaults(t *testing.T) {
 	t.Parallel()
 
@@ -1201,8 +1454,8 @@ func TestPiProviderDefaults(t *testing.T) {
 	if result.Tmux == nil {
 		t.Fatal("fillRuntimeDefaults(pi) should auto-fill Tmux")
 	}
-	if result.Tmux.ReadyDelayMs != 3000 {
-		t.Errorf("Tmux.ReadyDelayMs = %d, want 3000", result.Tmux.ReadyDelayMs)
+	if result.Tmux.ReadyDelayMs != 8000 {
+		t.Errorf("Tmux.ReadyDelayMs = %d, want 8000", result.Tmux.ReadyDelayMs)
 	}
 	wantNames := []string{"pi", "node", "bun"}
 	if len(result.Tmux.ProcessNames) != len(wantNames) {
@@ -1449,12 +1702,12 @@ func TestACPModes(t *testing.T) {
 	t.Cleanup(ResetRegistryForTesting)
 
 	tests := []struct {
-		name      string
-		rc        *RuntimeConfig
-		wantACP   bool
-		wantMode  string
-		wantCmd   string
-		wantArgs  []string
+		name     string
+		rc       *RuntimeConfig
+		wantACP  bool
+		wantMode string
+		wantCmd  string
+		wantArgs []string
 	}{
 		{
 			name: "native mode - claude-agent-acp",

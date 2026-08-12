@@ -7,10 +7,12 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/estop"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 func runMailCheck(cmd *cobra.Command, args []string) error {
@@ -43,14 +45,15 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("getting mailbox: %w", err)
 	}
 
-	// Count unread
-	_, unread, err := mailbox.Count()
+	// Load the inbox once. The inject path needs unread messages later, and
+	// calling Count() followed by ListUnread() doubles bd/Dolt reads.
+	messages, _, unread, err := loadInboxSnapshot(mailbox, false)
 	if err != nil {
 		if mailCheckInject {
-			fmt.Fprintf(os.Stderr, "gt mail check: count error for %s: %v\n", address, err)
+			fmt.Fprintf(os.Stderr, "gt mail check: inbox load error for %s: %v\n", address, err)
 			return nil
 		}
-		return fmt.Errorf("counting messages: %w", err)
+		return fmt.Errorf("loading inbox: %w", err)
 	}
 
 	// JSON output
@@ -70,12 +73,25 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 	// at the next task boundary, normal/low is informational but still
 	// checked before going idle (prevents mail from sitting unread).
 	if mailCheckInject {
-		if unread > 0 {
-			messages, listErr := mailbox.ListUnread()
-			if listErr != nil {
-				fmt.Fprintf(os.Stderr, "gt mail check: could not list unread for %s: %v\n", address, listErr)
-				return nil
+		// Agent-side E-stop check (defense-in-depth).
+		// If an E-stop is active (town-wide or per-rig), inject a system reminder
+		// telling the agent to checkpoint and wait. This catches agents that
+		// survived the SIGTSTP freeze.
+		if townRoot, twErr := workspace.FindFromCwd(); twErr == nil {
+			rigName := os.Getenv("GT_RIG")
+			if estop.IsActive(townRoot) || (rigName != "" && estop.IsRigActive(townRoot, rigName)) {
+				fmt.Print("<system-reminder>\n")
+				fmt.Print("EMERGENCY STOP ACTIVE. All work is paused.\n")
+				fmt.Print("Do NOT start new tasks or tool calls. Checkpoint your current state\n")
+				fmt.Print("(save progress notes) and wait for the overseer to run 'gt thaw'.\n")
+				fmt.Print("This is a system-level pause — it may be due to infrastructure failure,\n")
+				fmt.Print("maintenance, or the operator traveling.\n")
+				fmt.Print("</system-reminder>\n")
 			}
+		}
+
+		if unread > 0 {
+			messages = filterUnreadMessages(messages)
 			fmt.Print(formatInjectOutput(messages))
 			// Ack after output so message is delivered before being marked acked.
 			if ackErr := mailbox.AcknowledgeDeliveries(address, messages); ackErr != nil {

@@ -3,10 +3,13 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +19,34 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 )
 
+// captureStdout redirects os.Stdout to a pipe, calls fn, then returns whatever
+// fn wrote. Reading happens in a goroutine so the pipe buffer cannot deadlock
+// even when fn produces more output than the OS pipe buffer (4 KB on Windows).
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+
+	// Drain the read side concurrently so writes never block.
+	var buf bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		io.Copy(&buf, r)
+		close(done)
+	}()
+
+	fn()
+
+	w.Close()
+	<-done
+	os.Stdout = oldStdout
+	return buf.String()
+}
+
 func writeTestRoutes(t *testing.T, townRoot string, routes []beads.Route) {
 	t.Helper()
 	beadsDir := filepath.Join(townRoot, ".beads")
@@ -24,6 +55,22 @@ func writeTestRoutes(t *testing.T, townRoot string, routes []beads.Route) {
 	}
 	if err := beads.WriteRoutes(beadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
+	}
+}
+
+func TestRenderFormulaStepsFull_DeaconIncludesHeartbeatCommand(t *testing.T) {
+	out, err := renderFormulaStepsFull(constants.MolDeaconPatrol, t.TempDir(), "")
+	if err != nil {
+		t.Fatalf("renderFormulaStepsFull: %v", err)
+	}
+	for _, want := range []string{
+		"### Step 1: Refresh heartbeat",
+		"gt deacon heartbeat \"starting patrol cycle\"",
+		"This MUST run before any other step.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("rendered deacon patrol missing %q:\n%s", want, out)
+		}
 	}
 }
 
@@ -101,6 +148,44 @@ func TestGetAgentBeadID_UsesRigPrefix(t *testing.T) {
 				t.Fatalf("getAgentBeadID() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRigBeadsRootPrefersRouteResolvedRigDir(t *testing.T) {
+	townRoot := t.TempDir()
+	writeTestRoutes(t, townRoot, []beads.Route{
+		{Prefix: "gt-", Path: "gastown/mayor/rig"},
+		{Prefix: "hq-", Path: "."},
+	})
+
+	ctx := RoleContext{
+		Role:     RolePolecat,
+		Rig:      "gastown",
+		Polecat:  "toast",
+		TownRoot: townRoot,
+		WorkDir:  filepath.Join(townRoot, "gastown", "polecats", "toast", "gastown"),
+	}
+
+	got := rigBeadsRoot(ctx)
+	want := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	if got != want {
+		t.Fatalf("rigBeadsRoot() = %q, want route-resolved %q", got, want)
+	}
+}
+
+func TestRigBeadsRootFallsBackWhenRouteMissing(t *testing.T) {
+	townRoot := t.TempDir()
+	ctx := RoleContext{
+		Role:     RolePolecat,
+		Rig:      "gastown",
+		TownRoot: townRoot,
+		WorkDir:  filepath.Join(townRoot, "gastown", "polecats", "toast", "gastown"),
+	}
+
+	got := rigBeadsRoot(ctx)
+	want := filepath.Join(townRoot, "gastown")
+	if got != want {
+		t.Fatalf("rigBeadsRoot() = %q, want fallback %q", got, want)
 	}
 }
 
@@ -186,24 +271,15 @@ func TestCheckHandoffMarkerDryRun(t *testing.T) {
 		t.Fatalf("write handoff marker: %v", err)
 	}
 
-	// Capture stdout to verify explain output
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
 	// Enable explain mode for this test
 	oldExplain := primeExplain
 	primeExplain = true
 	defer func() { primeExplain = oldExplain }()
 
-	// Call dry-run version
-	checkHandoffMarkerDryRun(workDir)
-
-	w.Close()
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	os.Stdout = oldStdout
-	output := buf.String()
+	// Capture stdout to verify explain output
+	output := captureStdout(t, func() {
+		checkHandoffMarkerDryRun(workDir)
+	})
 
 	// Verify marker still exists (not removed in dry-run)
 	if _, err := os.Stat(markerPath); os.IsNotExist(err) {
@@ -235,24 +311,15 @@ func TestCheckHandoffMarkerDryRun_NoMarker(t *testing.T) {
 		t.Fatalf("create runtime dir: %v", err)
 	}
 
-	// Capture stdout
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
 	// Enable explain mode
 	oldExplain := primeExplain
 	primeExplain = true
 	defer func() { primeExplain = oldExplain }()
 
 	// Should not panic when marker doesn't exist
-	checkHandoffMarkerDryRun(workDir)
-
-	w.Close()
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	os.Stdout = oldStdout
-	output := buf.String()
+	output := captureStdout(t, func() {
+		checkHandoffMarkerDryRun(workDir)
+	})
 
 	// Verify explain output indicates no marker
 	if !strings.Contains(output, "no handoff marker") {
@@ -445,18 +512,9 @@ func TestOutputState(t *testing.T) {
 			WorkDir: workDir,
 		}
 
-		// Capture stdout
-		oldStdout := os.Stdout
-		r, w, _ := os.Pipe()
-		os.Stdout = w
-
-		outputState(ctx, false)
-
-		w.Close()
-		var buf bytes.Buffer
-		io.Copy(&buf, r)
-		os.Stdout = oldStdout
-		output := buf.String()
+		output := captureStdout(t, func() {
+			outputState(ctx, false)
+		})
 
 		if !strings.Contains(output, "state: normal") {
 			t.Fatalf("expected 'state: normal' in output, got: %s", output)
@@ -475,18 +533,9 @@ func TestOutputState(t *testing.T) {
 			WorkDir: workDir,
 		}
 
-		// Capture stdout
-		oldStdout := os.Stdout
-		r, w, _ := os.Pipe()
-		os.Stdout = w
-
-		outputState(ctx, true)
-
-		w.Close()
-		var buf bytes.Buffer
-		io.Copy(&buf, r)
-		os.Stdout = oldStdout
-		output := buf.String()
+		output := captureStdout(t, func() {
+			outputState(ctx, true)
+		})
 
 		// Parse JSON output
 		var state SessionState
@@ -523,18 +572,9 @@ func TestOutputState(t *testing.T) {
 			WorkDir: workDir,
 		}
 
-		// Capture stdout
-		oldStdout := os.Stdout
-		r, w, _ := os.Pipe()
-		os.Stdout = w
-
-		outputState(ctx, true)
-
-		w.Close()
-		var buf bytes.Buffer
-		io.Copy(&buf, r)
-		os.Stdout = oldStdout
-		output := buf.String()
+		output := captureStdout(t, func() {
+			outputState(ctx, true)
+		})
 
 		// Parse JSON
 		var state SessionState
@@ -554,23 +594,14 @@ func TestOutputState(t *testing.T) {
 // TestExplain tests the explain function output.
 func TestExplain(t *testing.T) {
 	t.Run("explain_enabled_condition_true", func(t *testing.T) {
-		// Capture stdout
-		oldStdout := os.Stdout
-		r, w, _ := os.Pipe()
-		os.Stdout = w
-
 		// Enable explain mode
 		oldExplain := primeExplain
 		primeExplain = true
 		defer func() { primeExplain = oldExplain }()
 
-		explain(true, "This is a test explanation")
-
-		w.Close()
-		var buf bytes.Buffer
-		io.Copy(&buf, r)
-		os.Stdout = oldStdout
-		output := buf.String()
+		output := captureStdout(t, func() {
+			explain(true, "This is a test explanation")
+		})
 
 		if !strings.Contains(output, "[EXPLAIN]") {
 			t.Fatalf("expected [EXPLAIN] tag in output, got: %s", output)
@@ -581,23 +612,14 @@ func TestExplain(t *testing.T) {
 	})
 
 	t.Run("explain_enabled_condition_false", func(t *testing.T) {
-		// Capture stdout
-		oldStdout := os.Stdout
-		r, w, _ := os.Pipe()
-		os.Stdout = w
-
 		// Enable explain mode
 		oldExplain := primeExplain
 		primeExplain = true
 		defer func() { primeExplain = oldExplain }()
 
-		explain(false, "This should not appear")
-
-		w.Close()
-		var buf bytes.Buffer
-		io.Copy(&buf, r)
-		os.Stdout = oldStdout
-		output := buf.String()
+		output := captureStdout(t, func() {
+			explain(false, "This should not appear")
+		})
 
 		if strings.Contains(output, "[EXPLAIN]") {
 			t.Fatalf("expected no [EXPLAIN] tag when condition is false, got: %s", output)
@@ -605,23 +627,14 @@ func TestExplain(t *testing.T) {
 	})
 
 	t.Run("explain_disabled", func(t *testing.T) {
-		// Capture stdout
-		oldStdout := os.Stdout
-		r, w, _ := os.Pipe()
-		os.Stdout = w
-
 		// Disable explain mode
 		oldExplain := primeExplain
 		primeExplain = false
 		defer func() { primeExplain = oldExplain }()
 
-		explain(true, "This should not appear either")
-
-		w.Close()
-		var buf bytes.Buffer
-		io.Copy(&buf, r)
-		os.Stdout = oldStdout
-		output := buf.String()
+		output := captureStdout(t, func() {
+			explain(true, "This should not appear either")
+		})
 
 		if strings.Contains(output, "[EXPLAIN]") {
 			t.Fatalf("expected no [EXPLAIN] tag when explain mode disabled, got: %s", output)
@@ -830,14 +843,9 @@ func TestCheckHandoffMarkerParsesReason(t *testing.T) {
 		}
 
 		// Capture stdout (checkHandoffMarker outputs the warning)
-		oldStdout := os.Stdout
-		_, w, _ := os.Pipe()
-		os.Stdout = w
-
-		checkHandoffMarker(workDir)
-
-		w.Close()
-		os.Stdout = oldStdout
+		captureStdout(t, func() {
+			checkHandoffMarker(workDir)
+		})
 
 		// Verify reason was parsed
 		if primeHandoffReason != "compaction" {
@@ -865,14 +873,9 @@ func TestCheckHandoffMarkerParsesReason(t *testing.T) {
 			t.Fatalf("write marker: %v", err)
 		}
 
-		oldStdout := os.Stdout
-		_, w, _ := os.Pipe()
-		os.Stdout = w
-
-		checkHandoffMarker(workDir)
-
-		w.Close()
-		os.Stdout = oldStdout
+		captureStdout(t, func() {
+			checkHandoffMarker(workDir)
+		})
 
 		// Verify reason is empty (backward compatible)
 		if primeHandoffReason != "" {
@@ -897,21 +900,13 @@ func TestCheckHandoffMarkerParsesReason(t *testing.T) {
 // outputs the expected content without the full autonomous mode block (GH#1965).
 func TestOutputContinuationDirective(t *testing.T) {
 	t.Run("basic_bead", func(t *testing.T) {
-		oldStdout := os.Stdout
-		r, w, _ := os.Pipe()
-		os.Stdout = w
-
 		bead := &beads.Issue{
 			ID:    "gt-test123",
 			Title: "Test bead title",
 		}
-		outputContinuationDirective(bead, false)
-
-		w.Close()
-		var buf bytes.Buffer
-		io.Copy(&buf, r)
-		os.Stdout = oldStdout
-		output := buf.String()
+		output := captureStdout(t, func() {
+			outputContinuationDirective(bead, false)
+		})
 
 		// Should contain continuation directive
 		if !strings.Contains(output, "CONTINUE HOOKED WORK") {
@@ -931,21 +926,13 @@ func TestOutputContinuationDirective(t *testing.T) {
 	})
 
 	t.Run("bead_with_molecule", func(t *testing.T) {
-		oldStdout := os.Stdout
-		r, w, _ := os.Pipe()
-		os.Stdout = w
-
 		bead := &beads.Issue{
 			ID:    "gt-mol456",
 			Title: "Molecule bead",
 		}
-		outputContinuationDirective(bead, true)
-
-		w.Close()
-		var buf bytes.Buffer
-		io.Copy(&buf, r)
-		os.Stdout = oldStdout
-		output := buf.String()
+		output := captureStdout(t, func() {
+			outputContinuationDirective(bead, true)
+		})
 
 		if !strings.Contains(output, "bd mol current") {
 			t.Fatalf("expected molecule hint in output, got: %s", output)
@@ -964,17 +951,14 @@ func TestCheckSlungWork_StandaloneFormulaUsesWorkflowOutput(t *testing.T) {
 		}, "\n"),
 	}
 
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	found := checkSlungWork(ctx, hookedBead)
-
-	w.Close()
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	os.Stdout = oldStdout
-	output := buf.String()
+	var found bool
+	var gotErr error
+	output := captureStdout(t, func() {
+		found, gotErr = checkSlungWork(ctx, hookedBead)
+	})
+	if gotErr != nil {
+		t.Fatalf("checkSlungWork() error = %v", gotErr)
+	}
 
 	if !found {
 		t.Fatalf("checkSlungWork() = false, want true")
@@ -987,5 +971,475 @@ func TestCheckSlungWork_StandaloneFormulaUsesWorkflowOutput(t *testing.T) {
 	}
 	if !strings.Contains(output, "--var version=1.2.3") {
 		t.Fatalf("expected standalone formula context to be shown, got:\n%s", output)
+	}
+}
+
+func TestOutputAutonomousDirectiveForkRigAvoidsMergeQueueGuidance(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "myrig"), 0o755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "myrig", "config.json"), []byte(`{"upstream_url":"https://token@example.com/upstream/repo.git"}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	output := captureStdout(t, func() {
+		outputAutonomousDirective(RoleContext{Role: RolePolecat, Rig: "myrig", TownRoot: townRoot, Polecat: "scout"}, &beads.Issue{ID: "gt-test", Title: "test"}, false)
+	})
+	if !strings.Contains(output, "FORK-BACKED RIG") {
+		t.Fatalf("expected fork-backed directive, got:\n%s", output)
+	}
+	for _, forbidden := range []string{"submit to the merge queue", "use the merge queue", "token"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("fork autonomous output contains forbidden %q:\n%s", forbidden, output)
+		}
+	}
+}
+
+func TestOutputMoleculeWorkflowForkRigOverridesFormulaMergeQueueReminder(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "myrig"), 0o755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "myrig", "config.json"), []byte(`{"upstream_url":"https://github.com/upstream/repo"}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := outputMoleculeWorkflow(RoleContext{Role: RolePolecat, Rig: "myrig", TownRoot: townRoot}, &beads.AttachmentFields{AttachedFormula: "mol-polecat-work"}); err != nil {
+			t.Fatalf("outputMoleculeWorkflow: %v", err)
+		}
+	})
+	if !strings.Contains(output, "FORK-BACKED RIG OVERRIDE") {
+		t.Fatalf("expected fork override, got:\n%s", output)
+	}
+	for _, forbidden := range []string{"REQUIRED: When all steps complete", "gt done", "submit to the merge queue"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("fork molecule workflow kept unsafe formula text %q:\n%s", forbidden, output)
+		}
+	}
+}
+
+func TestCheckSlungWork_RefinerySafetyStoppedSkipsWorkflowOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mock bd script uses POSIX shell")
+	}
+	townRoot := setupRefinerySafetyStopTown(t)
+	installRefinerySafetyStopMockBD(t)
+
+	ctx := RoleContext{Role: RoleRefinery, Rig: "testrig", TownRoot: townRoot}
+	hookedBead := &beads.Issue{
+		ID:    "gt-wisp-refinery",
+		Title: constants.MolRefineryPatrol,
+		Description: strings.Join([]string{
+			"attached_formula: " + constants.MolRefineryPatrol,
+			`attached_vars: ["target_branch=main"]`,
+		}, "\n"),
+	}
+
+	var found bool
+	var gotErr error
+	output := captureStdout(t, func() {
+		found, gotErr = checkSlungWork(ctx, hookedBead)
+	})
+	if gotErr != nil {
+		t.Fatalf("checkSlungWork() error = %v", gotErr)
+	}
+	if !found {
+		t.Fatalf("checkSlungWork() = false, want true")
+	}
+	if !strings.Contains(output, "REFINERY SAFETY STOP ACTIVE") {
+		t.Fatalf("expected safety-stop directive, got:\n%s", output)
+	}
+	for _, forbidden := range []string{"ATTACHED FORMULA", "AUTONOMOUS WORK MODE", "Work through each patrol step"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("did not expect %q while safety-stopped, got:\n%s", forbidden, output)
+		}
+	}
+}
+
+func TestOutputStartupDirective_RefinerySafetyStoppedSkipsPatrolNew(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mock bd script uses POSIX shell")
+	}
+	townRoot := setupRefinerySafetyStopTown(t)
+	installRefinerySafetyStopMockBD(t)
+
+	output := captureStdout(t, func() {
+		outputStartupDirective(RoleContext{Role: RoleRefinery, Rig: "testrig", TownRoot: townRoot})
+	})
+	if !strings.Contains(output, "No patrol needed. Exit cleanly.") {
+		t.Fatalf("expected safety-stop startup directive, got:\n%s", output)
+	}
+	if strings.Contains(output, "gt patrol new") || strings.Contains(output, "create patrol") {
+		t.Fatalf("startup directive should not tell safety-stopped refinery to create patrol, got:\n%s", output)
+	}
+}
+
+func TestCheckSlungWork_RalphModeUsesLoopDirective(t *testing.T) {
+	configDir := t.TempDir()
+	pluginsDir := filepath.Join(configDir, "plugins")
+	if err := os.MkdirAll(pluginsDir, 0755); err != nil {
+		t.Fatalf("mkdir plugins: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginsDir, "installed_plugins.json"), []byte(`{"plugins":{"ralph-loop@claude-plugins-official":{}}}`), 0644); err != nil {
+		t.Fatalf("write plugin manifest: %v", err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+
+	ctx := RoleContext{Role: RoleCrew}
+	hookedBead := &beads.Issue{
+		ID:    "gt-wisp-ralph",
+		Title: "Ralph workflow",
+		Description: strings.Join([]string{
+			"attached_molecule: gt-wisp-ralph",
+			"attached_args: do the loop",
+			"mode: ralph",
+		}, "\n"),
+	}
+
+	var found bool
+	var gotErr error
+	output := captureStdout(t, func() {
+		found, gotErr = checkSlungWork(ctx, hookedBead)
+	})
+	if gotErr != nil {
+		t.Fatalf("checkSlungWork() error = %v", gotErr)
+	}
+	if !found {
+		t.Fatalf("checkSlungWork() = false, want true")
+	}
+	if !strings.Contains(output, "/ralph-loop ") || !strings.Contains(output, "--completion-promise DONE") {
+		t.Fatalf("expected ralph-loop directive, got:\n%s", output)
+	}
+	if strings.Contains(output, "Formula Checklist") {
+		t.Fatalf("ralph mode should emit plugin directive instead of inline checklist, got:\n%s", output)
+	}
+}
+
+// TestCompactResumeReminder_PolecatGetsGtDone verifies that polecats get a
+// gt done reminder after context compaction. This is the regression test for
+// the polecats-no-gt-done bug: after long work sessions, compaction drops the
+// formula checklist and the agent forgets to call gt done.
+func TestCompactResumeReminder_PolecatGetsGtDone(t *testing.T) {
+	ctx := RoleContext{Role: RolePolecat}
+	// Simulate compact source
+	primeHookSource = "compact"
+	defer func() { primeHookSource = "" }()
+
+	output := captureStdout(t, func() {
+		runPrimeCompactResume(ctx)
+	})
+
+	if !strings.Contains(output, "gt done") {
+		t.Fatalf("compact/resume for polecat must remind about gt done, got:\n%s", output)
+	}
+}
+
+// TestCompactResumeReminder_NonPolecatNoGtDone verifies that non-polecat roles
+// do NOT get the gt done reminder (it's polecat-specific).
+func TestCompactResumeReminder_NonPolecatNoGtDone(t *testing.T) {
+	ctx := RoleContext{Role: RoleCrew}
+	primeHookSource = "compact"
+	defer func() { primeHookSource = "" }()
+
+	output := captureStdout(t, func() {
+		runPrimeCompactResume(ctx)
+	})
+
+	if strings.Contains(output, "gt done") {
+		t.Fatalf("compact/resume for non-polecat should NOT mention gt done, got:\n%s", output)
+	}
+}
+
+func TestEnsureBeadsRedirect_WitnessCreatesRedirect(t *testing.T) {
+	townRoot := t.TempDir()
+	rigRoot := filepath.Join(townRoot, "testrig")
+	witnessDir := filepath.Join(rigRoot, "witness")
+	mayorBeadsDir := filepath.Join(rigRoot, "mayor", "rig", ".beads")
+	if err := os.MkdirAll(witnessDir, 0755); err != nil {
+		t.Fatalf("mkdir witness dir: %v", err)
+	}
+	if err := os.MkdirAll(mayorBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir mayor beads dir: %v", err)
+	}
+
+	ctx := RoleContext{
+		Role:     RoleWitness,
+		WorkDir:  witnessDir,
+		TownRoot: townRoot,
+	}
+
+	ensureBeadsRedirect(ctx)
+
+	redirectPath := filepath.Join(witnessDir, ".beads", "redirect")
+	content, err := os.ReadFile(redirectPath)
+	if err != nil {
+		t.Fatalf("read redirect: %v", err)
+	}
+	if got, want := string(content), "../mayor/rig/.beads\n"; got != want {
+		t.Fatalf("redirect content = %q, want %q", got, want)
+	}
+}
+
+func TestEnsureBeadsRedirect_RepairsExistingRedirectChain(t *testing.T) {
+	townRoot := t.TempDir()
+	rigRoot := filepath.Join(townRoot, "testrig")
+	rigBeadsDir := filepath.Join(rigRoot, ".beads")
+	mayorBeadsDir := filepath.Join(rigRoot, "mayor", "rig", ".beads")
+	workDir := filepath.Join(rigRoot, "polecats", "worker1", "testrig")
+	workBeadsDir := filepath.Join(workDir, ".beads")
+
+	if err := os.MkdirAll(mayorBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir mayor beads dir: %v", err)
+	}
+	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir rig beads dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write rig redirect: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "metadata.json"), []byte(`{"dolt_database":"hq","backend":"dolt"}`), 0644); err != nil {
+		t.Fatalf("write rig metadata: %v", err)
+	}
+	if err := os.MkdirAll(workBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir work beads dir: %v", err)
+	}
+
+	// Old polecat worktrees can keep this bd-incompatible chain:
+	// worktree/.beads -> rig/.beads -> mayor/rig/.beads.
+	redirectPath := filepath.Join(workBeadsDir, "redirect")
+	if err := os.WriteFile(redirectPath, []byte("../../../.beads\n"), 0644); err != nil {
+		t.Fatalf("write stale redirect: %v", err)
+	}
+
+	ctx := RoleContext{
+		Role:     RolePolecat,
+		WorkDir:  workDir,
+		TownRoot: townRoot,
+	}
+
+	ensureBeadsRedirect(ctx)
+
+	content, err := os.ReadFile(redirectPath)
+	if err != nil {
+		t.Fatalf("read redirect: %v", err)
+	}
+	if got, want := string(content), "../../../mayor/rig/.beads\n"; got != want {
+		t.Fatalf("redirect content = %q, want %q", got, want)
+	}
+}
+
+func TestEnsureBeadsRedirect_CleansIdentityFilesWhenRedirectAlreadyCorrect(t *testing.T) {
+	runGit := func(t *testing.T, dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+
+	townRoot := t.TempDir()
+	rigRoot := filepath.Join(townRoot, "testrig")
+	rigBeadsDir := filepath.Join(rigRoot, ".beads")
+	mayorBeadsDir := filepath.Join(rigRoot, "mayor", "rig", ".beads")
+	workDir := filepath.Join(rigRoot, "polecats", "worker1", "gastown")
+	workBeadsDir := filepath.Join(workDir, ".beads")
+
+	if err := os.MkdirAll(mayorBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir mayor beads dir: %v", err)
+	}
+	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir rig beads dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write rig redirect: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "metadata.json"), []byte(`{"dolt_database":"hq","backend":"dolt"}`), 0644); err != nil {
+		t.Fatalf("write rig metadata: %v", err)
+	}
+	if err := os.MkdirAll(workBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir work beads dir: %v", err)
+	}
+	runGit(t, workDir, "init")
+
+	redirectPath := filepath.Join(workBeadsDir, "redirect")
+	if err := os.WriteFile(redirectPath, []byte("../../../mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write redirect: %v", err)
+	}
+	for _, file := range []string{"metadata.json", "config.yaml"} {
+		if err := os.WriteFile(filepath.Join(workBeadsDir, file), []byte("stale identity"), 0644); err != nil {
+			t.Fatalf("write %s: %v", file, err)
+		}
+	}
+
+	ctx := RoleContext{
+		Role:     RolePolecat,
+		WorkDir:  workDir,
+		TownRoot: townRoot,
+	}
+
+	ensureBeadsRedirect(ctx)
+
+	content, err := os.ReadFile(redirectPath)
+	if err != nil {
+		t.Fatalf("read redirect: %v", err)
+	}
+	if got, want := string(content), "../../../mayor/rig/.beads\n"; got != want {
+		t.Fatalf("redirect content = %q, want %q", got, want)
+	}
+	for _, file := range []string{"metadata.json", "config.yaml"} {
+		if _, err := os.Stat(filepath.Join(workBeadsDir, file)); !os.IsNotExist(err) {
+			t.Fatalf("%s should have been cleaned, stat err=%v", file, err)
+		}
+	}
+}
+
+func TestOutputRalphLoopDirective_PluginInstalled(t *testing.T) {
+	attachment := &beads.AttachmentFields{
+		Mode:            "ralph",
+		AttachedFormula: "mol-polecat-work",
+		AttachedArgs:    "Run story audit, fix worst gap, commit, loop",
+		FormulaVars:     "base_branch=main",
+	}
+	var gotErr error
+	output := captureStdout(t, func() {
+		gotErr = outputRalphLoopDirectiveWithPluginCheck(RoleContext{}, attachment, true, t.TempDir())
+	})
+	if gotErr != nil {
+		t.Fatalf("outputRalphLoopDirectiveWithPluginCheck: %v", gotErr)
+	}
+
+	if !strings.Contains(output, "/ralph-loop ") {
+		t.Fatalf("expected /ralph-loop command, got:\n%s", output)
+	}
+	if !strings.Contains(output, "--completion-promise DONE") {
+		t.Fatalf("expected completion promise flag, got:\n%s", output)
+	}
+	if !strings.Contains(output, "Formula Checklist") {
+		t.Fatalf("expected rendered formula checklist in prompt, got:\n%s", output)
+	}
+	if !strings.Contains(output, "story audit") {
+		t.Fatalf("expected attached args in prompt, got:\n%s", output)
+	}
+	if !strings.Contains(output, `<promise>DONE</promise>`) {
+		t.Fatalf("expected DONE promise instruction in prompt, got:\n%s", output)
+	}
+}
+
+func TestOutputRalphLoopDirective_PluginMissing(t *testing.T) {
+	var gotErr error
+	output := captureStdout(t, func() {
+		gotErr = outputRalphLoopDirectiveWithPluginCheck(RoleContext{}, &beads.AttachmentFields{Mode: "ralph"}, false, "/tmp/claude-test")
+	})
+	if gotErr == nil {
+		t.Fatal("expected missing plugin error")
+	}
+	if !strings.Contains(gotErr.Error(), ralphLoopPluginID) || !strings.Contains(gotErr.Error(), "/plugin install") {
+		t.Fatalf("missing plugin error not actionable: %v", gotErr)
+	}
+	if strings.Contains(output, "/ralph-loop") {
+		t.Fatalf("should not emit /ralph-loop when plugin is missing, got:\n%s", output)
+	}
+}
+
+func TestRalphLoopPluginInstalledIn(t *testing.T) {
+	pluginsDir := filepath.Join(t.TempDir(), "plugins")
+	if err := os.MkdirAll(pluginsDir, 0755); err != nil {
+		t.Fatalf("mkdir plugins: %v", err)
+	}
+	manifestPath := filepath.Join(pluginsDir, "installed_plugins.json")
+	if err := os.WriteFile(manifestPath, []byte(`{"plugins":{"ralph-loop@claude-plugins-official":{},"ralph-loop-evil@claude-plugins-official":{}}}`), 0644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	installed, err := ralphLoopPluginInstalledIn(manifestPath)
+	if err != nil {
+		t.Fatalf("ralphLoopPluginInstalledIn: %v", err)
+	}
+	if !installed {
+		t.Fatal("expected canonical ralph-loop plugin to be detected")
+	}
+
+	if err := os.WriteFile(manifestPath, []byte(`{"plugins":{"ralph-loop-evil@claude-plugins-official":{}}}`), 0644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	installed, err = ralphLoopPluginInstalledIn(manifestPath)
+	if err != nil {
+		t.Fatalf("ralphLoopPluginInstalledIn malicious key: %v", err)
+	}
+	if installed {
+		t.Fatal("must not accept prefix-like plugin IDs")
+	}
+}
+
+func TestIsRalphLoopPluginInstalledUsesClaudeConfigDir(t *testing.T) {
+	configDir := t.TempDir()
+	pluginsDir := filepath.Join(configDir, "plugins")
+	if err := os.MkdirAll(pluginsDir, 0755); err != nil {
+		t.Fatalf("mkdir plugins: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginsDir, "installed_plugins.json"), []byte(`{"plugins":{"ralph-loop@claude-plugins-official":{}}}`), 0644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+
+	installed, gotConfigDir, err := isRalphLoopPluginInstalled()
+	if err != nil {
+		t.Fatalf("isRalphLoopPluginInstalled: %v", err)
+	}
+	if !installed {
+		t.Fatal("expected plugin installed via CLAUDE_CONFIG_DIR")
+	}
+	if gotConfigDir != configDir {
+		t.Fatalf("configDir = %q, want %q", gotConfigDir, configDir)
+	}
+}
+
+func TestQuoteForRalphLoop(t *testing.T) {
+	quoted := quoteForRalphLoop("line1\r\nline2 \"quoted\" \\ $HOME `cmd`")
+	if !strings.HasPrefix(quoted, `"`) || !strings.HasSuffix(quoted, `"`) {
+		t.Fatalf("expected double-quoted prompt, got %q", quoted)
+	}
+	for _, forbidden := range []string{"\n", "\r"} {
+		if strings.Contains(quoted, forbidden) {
+			t.Fatalf("quoted prompt contains raw line break %q: %q", forbidden, quoted)
+		}
+	}
+	for _, want := range []string{`\n`, `\"`, `\\`, `\$`, "\\`"} {
+		if !strings.Contains(quoted, want) {
+			t.Fatalf("quoted prompt missing escape %q: %q", want, quoted)
+		}
+	}
+}
+
+func TestIsBeadNotFound(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"no issue found lowercase", errors.New("bd: no issue found"), true},
+		{"No issue found cased", errors.New("ERROR: No issue found in DB"), true},
+		{"not found", errors.New("error: not found in beads"), true},
+		{"issue not found phrasing", errors.New("rpc: issue not found"), true},
+		{"connection refused", errors.New("dial tcp: connection refused"), false},
+		{"random error", errors.New("schema mismatch"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isBeadNotFound(tt.err); got != tt.want {
+				t.Errorf("isBeadNotFound(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestErrHookUnresolvable_IsErrors(t *testing.T) {
+	wrapped := fmt.Errorf("%w: agent=foo hook_bead=hq-igrp", ErrHookUnresolvable)
+	if !errors.Is(wrapped, ErrHookUnresolvable) {
+		t.Fatalf("errors.Is should report wrapped err matches ErrHookUnresolvable")
 	}
 }

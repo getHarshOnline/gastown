@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -279,9 +281,14 @@ func runCompact(cmd *cobra.Command, args []string) error {
 // but leaves behind its dependency records (bd delete has no cascade logic for
 // the wisp-level tables). Runs as a post-compact sweep.
 func cleanOrphanedWispDeps(bd *beads.Beads, result *compactResult) {
+	columns, err := bd.Run("sql", "--csv", "SHOW COLUMNS FROM wisp_dependencies")
+	if err != nil || !strings.Contains(string(columns), "\ndepends_on_wisp_id,") || !strings.Contains(string(columns), "\ndepends_on_issue_id,") {
+		return
+	}
 	const q = `DELETE FROM wisp_dependencies WHERE ` +
 		`NOT EXISTS (SELECT 1 FROM wisps WHERE id = wisp_dependencies.issue_id) ` +
-		`OR NOT EXISTS (SELECT 1 FROM wisps WHERE id = wisp_dependencies.depends_on_id)`
+		`OR (depends_on_wisp_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM wisps WHERE id = wisp_dependencies.depends_on_wisp_id)) ` +
+		`OR (depends_on_issue_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM issues WHERE id = wisp_dependencies.depends_on_issue_id))`
 	out, err := bd.Run("sql", q)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("orphaned wisp_deps cleanup: %v", err))
@@ -304,6 +311,12 @@ func listWisps(bd *beads.Beads) ([]*compactIssue, error) {
 		return nil, err
 	}
 
+	// Strip any non-JSON prefix (warnings, notices) that bd may emit to
+	// stdout before the JSON array. Without this, unicode characters like
+	// emoji in wisp subjects can trigger "invalid character looking for
+	// beginning of value" errors when a warning line contains non-ASCII.
+	out = extractJSONArray(out)
+
 	var allIssues []*compactIssue
 	if err := json.Unmarshal(out, &allIssues); err != nil {
 		return nil, fmt.Errorf("parsing issue list: %w", err)
@@ -318,6 +331,18 @@ func listWisps(bd *beads.Beads) ([]*compactIssue, error) {
 	}
 
 	return wisps, nil
+}
+
+// extractJSONArray finds the first '[' byte in data and returns from that
+// point onward. This strips any non-JSON prefix (warning messages, notices)
+// that a subprocess may emit to stdout before the actual JSON payload.
+// Returns the original data unchanged if no '[' is found.
+func extractJSONArray(data []byte) []byte {
+	idx := bytes.IndexByte(data, '[')
+	if idx < 0 {
+		return data
+	}
+	return data[idx:]
 }
 
 // promoteWisp makes a wisp permanent by setting --persistent and adding a comment.
@@ -341,7 +366,7 @@ func promoteWisp(bd *beads.Beads, w *compactIssue, reason string, result *compac
 	}
 
 	// Add comment noting the promotion
-	_, _ = bd.Run("comment", w.ID, fmt.Sprintf("Promoted from Level 0: %s", reason))
+	_, _ = bd.Run("comments", "add", w.ID, fmt.Sprintf("Promoted from Level 0: %s", reason))
 
 	result.Promoted = append(result.Promoted, action)
 
@@ -414,15 +439,17 @@ func printCompactSummary(result *compactResult) {
 	}
 }
 
-// compactTruncate shortens a string to maxLen, adding "..." if truncated.
+// compactTruncate shortens a string to maxLen runes, adding "..." if truncated.
+// Uses rune count instead of byte length so multi-byte UTF-8 characters
+// (emoji, CJK, etc.) are never split mid-sequence.
 func compactTruncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	if utf8.RuneCountInString(s) <= maxLen {
 		return s
 	}
 	if maxLen <= 3 {
-		return s[:maxLen]
+		return string([]rune(s)[:maxLen])
 	}
-	return s[:maxLen-3] + "..."
+	return string([]rune(s)[:maxLen-3]) + "..."
 }
 
 // hasComments checks the comment_count on the compactIssue.

@@ -1,20 +1,22 @@
 package cmd
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deps"
@@ -146,41 +148,35 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		if err := deps.EnsureBeads(true); err != nil {
 			return fmt.Errorf("beads dependency check failed: %w", err)
 		}
-	}
+		if err := ensureInstallDoltReady(); err != nil {
+			return err
+		}
 
-	// Preflight: ensure dolt identity before any workspace mutations.
-	// This prevents a partial install that can't be retried without --force.
-	if !installNoBeads {
-		if _, err := exec.LookPath("dolt"); err == nil {
-			if err := doltserver.EnsureDoltIdentity(); err != nil {
-				return fmt.Errorf("dolt identity setup failed (required for beads): %w\n\nTo fix, run:\n  dolt config --global --add user.name \"Your Name\"\n  dolt config --global --add user.email \"you@example.com\"", err)
-			}
+		// Preflight: ensure dolt identity before any workspace mutations.
+		// This prevents a partial install that can't be retried without --force.
+		if err := doltserver.EnsureDoltIdentity(); err != nil {
+			return fmt.Errorf("dolt identity setup failed (required for beads): %w\n\nTo fix, run:\n  dolt config --global --add user.name \"Your Name\"\n  dolt config --global --add user.email \"you@example.com\"", err)
+		}
 
-			// Preflight: check Dolt port availability before creating any files.
-			// A port conflict would leave a partial install that needs --force to retry.
-			port := doltserver.DefaultPort
-			if installDoltPort != 0 {
-				port = installDoltPort
-				os.Setenv("GT_DOLT_PORT", strconv.Itoa(port))
-			} else if p := os.Getenv("GT_DOLT_PORT"); p != "" {
-				if envPort, err := strconv.Atoi(p); err == nil {
-					port = envPort
-				}
+		// Preflight: check Dolt port availability before creating any files.
+		// A port conflict would leave a partial install that needs --force to retry.
+		port := doltserver.DefaultPort
+		if installDoltPort != 0 {
+			port = installDoltPort
+			os.Setenv("GT_DOLT_PORT", strconv.Itoa(port))
+		} else if p := os.Getenv("GT_DOLT_PORT"); p != "" {
+			if envPort, err := strconv.Atoi(p); err == nil {
+				port = envPort
 			}
-			if err := doltserver.CheckPortAvailable(port); err != nil {
-				// Port is in use — but if a Dolt server is already running
-				// on it, we can reuse it instead of starting a new one.
-				dsn := fmt.Sprintf("root:@tcp(127.0.0.1:%d)/", port)
-				if db, connErr := sql.Open("mysql", dsn); connErr == nil {
-					if pingErr := db.Ping(); pingErr == nil {
-						db.Close()
-						// Usable Dolt server on this port — skip the check.
-						fmt.Printf("   %s Using existing Dolt server on port %d\n",
-							style.Dim.Render("ℹ"), port)
-						goto portOK
-					}
-					db.Close()
-				}
+		}
+		externalTestDolt := useExternalTestDoltServer(port)
+		if err := doltserver.CheckPortAvailable(port); err != nil {
+			// Port is in use — but if a Dolt server is already running
+			// for this same town, we can reuse it instead of starting a new one.
+			if canReuseInstallDoltServer(absPath, port) || externalTestDolt {
+				fmt.Printf("   %s Using existing Dolt server on port %d\n",
+					style.Dim.Render("ℹ"), port)
+			} else {
 				pid, dataDir := doltserver.PortHolder(port)
 				msg := fmt.Sprintf("Dolt port %d is already in use", port)
 				if pid > 0 && dataDir != "" {
@@ -197,7 +193,6 @@ func runInstall(cmd *cobra.Command, args []string) error {
 				}
 				return fmt.Errorf("%s", msg)
 			}
-		portOK:
 		}
 	}
 
@@ -354,14 +349,17 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	// Town beads (hq- prefix) stores mayor mail, cross-rig coordination, and handoffs.
 	// Rig beads are separate and have their own prefixes.
 	if !installNoBeads {
+		port := doltserver.DefaultConfig(absPath).Port
+		externalTestDolt := useExternalTestDoltServer(port)
+
 		// Set up Dolt: identity → init-rig hq → server start.
 		// This ordering works because InitRig falls through to `dolt init`
 		// when the server isn't running yet.
-		if _, err := exec.LookPath("dolt"); err == nil {
-			// Identity was verified in preflight above.
-			// Create HQ database before starting server.
+		// Identity was verified in preflight above.
+		// Create HQ database before starting server.
+		if !externalTestDolt {
 			if _, _, err := doltserver.InitRig(absPath, "hq"); err != nil {
-				fmt.Printf("   %s Could not init HQ database: %v\n", style.Dim.Render("⚠"), err)
+				return fmt.Errorf("initializing HQ Dolt database: %w", err)
 			}
 
 			// Start the Dolt server — bd commands need a running server.
@@ -369,15 +367,13 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			// like a database). Stop it with 'gt dolt stop' when not needed.
 			if err := doltserver.Start(absPath); err != nil {
 				if !strings.Contains(err.Error(), "already running") {
-					fmt.Printf("   %s Could not start Dolt server: %v\n", style.Dim.Render("⚠"), err)
+					return fmt.Errorf("starting Dolt server for beads: %w", err)
 				}
 			}
-		} else {
-			fmt.Printf("   %s dolt not found in PATH — Dolt backend may not fully initialize\n", style.Dim.Render("⚠"))
 		}
 
 		if err := initTownBeads(absPath); err != nil {
-			fmt.Printf("   %s Could not initialize town beads: %v\n", style.Dim.Render("⚠"), err)
+			return fmt.Errorf("initializing town beads: %w", err)
 		} else {
 			fmt.Printf("   ✓ Initialized .beads/ (town-level beads with hq- prefix)\n")
 		}
@@ -495,9 +491,113 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	step++
 	fmt.Printf("  %d. Enter the Mayor's office: %s\n", step, style.Dim.Render("gt mayor attach"))
 	fmt.Println()
-	fmt.Printf("Note: Dolt server is running (stop with %s)\n", style.Dim.Render("gt dolt stop"))
+	if !installNoBeads {
+		fmt.Printf("Note: Dolt server is running (stop with %s)\n", style.Dim.Render("gt dolt stop"))
+	}
 
 	return nil
+}
+
+func ensureInstallDoltReady() error {
+	status, version, detail := deps.CheckDolt()
+	return formatInstallDoltError(status, version, detail, goruntime.GOOS)
+}
+
+const installDoltServerProbeTimeout = 2 * time.Second
+
+func canReuseInstallDoltServer(townRoot string, port int) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), installDoltServerProbeTimeout)
+	defer cancel()
+
+	probeTimeout := installDoltServerProbeTimeout.String()
+	// wa-d6f: socket-first probe DSN (TCP fallback) — even the install
+	// pre-flight should avoid TIME_WAIT churn when the server is up.
+	dsn := buildDoltDSN("root", port, "", dsnOpts{
+		Timeout:      probeTimeout,
+		ReadTimeout:  probeTimeout,
+		WriteTimeout: probeTimeout,
+	})
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return false
+	}
+	defer db.Close()
+	if err := db.PingContext(ctx); err != nil {
+		return false
+	}
+
+	// Only reuse a server that already belongs to this town. A random
+	// MySQL-compatible service or another town's Dolt server on the same port
+	// must remain a preflight failure; otherwise install can mutate the target
+	// and then fail during bd init.
+	databases, err := doltserver.ListDatabases(townRoot)
+	if err != nil || len(databases) == 0 {
+		return false
+	}
+	legitimate, err := doltserver.VerifyServerDataDir(townRoot)
+	return err == nil && legitimate
+}
+
+func useExternalTestDoltServer(port int) bool {
+	if os.Getenv("GT_TEST_EXTERNAL_DOLT") == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), installDoltServerProbeTimeout)
+	defer cancel()
+
+	probeTimeout := installDoltServerProbeTimeout.String()
+	dsn := fmt.Sprintf("root:@tcp(127.0.0.1:%d)/?timeout=%s&readTimeout=%s&writeTimeout=%s",
+		port, probeTimeout, probeTimeout, probeTimeout)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return false
+	}
+	defer db.Close()
+	return db.PingContext(ctx) == nil
+}
+
+func formatInstallDoltError(status deps.DoltStatus, version, detail, goos string) error {
+	switch status {
+	case deps.DoltOK:
+		return nil
+	case deps.DoltNotFound:
+		return fmt.Errorf("dolt is required for gt install with beads enabled but was not found in PATH.\n\nInstall Dolt:\n  %s\n\nTo create an HQ without beads, rerun with --no-beads.\nMore install options: %s", doltInstallHint(goos), deps.DoltInstallURL)
+	case deps.DoltTooOld:
+		return fmt.Errorf("dolt %s is too old for gt install with beads enabled (minimum: %s).\n\nUpgrade Dolt:\n  %s\n\nTo create an HQ without beads, rerun with --no-beads.", version, deps.MinDoltVersion, doltUpgradeHint(goos))
+	case deps.DoltExecFailed:
+		if detail == "" {
+			detail = "no diagnostic output"
+		}
+		return fmt.Errorf("'dolt version' failed, so gt install cannot verify the Dolt dependency required for beads.\n\nDetail: %s\n\nReinstall Dolt:\n  %s\n\nTo create an HQ without beads, rerun with --no-beads.", detail, doltReinstallHint(goos))
+	case deps.DoltUnknown:
+		if detail == "" {
+			detail = "no version output"
+		}
+		return fmt.Errorf("dolt version could not be parsed, so gt install cannot verify the Dolt dependency required for beads.\n\nDetail: %s\n\nReinstall Dolt:\n  %s\n\nTo create an HQ without beads, rerun with --no-beads.", detail, doltReinstallHint(goos))
+	default:
+		return fmt.Errorf("dolt dependency check failed with unknown status %d.\n\nTo create an HQ without beads, rerun with --no-beads.", status)
+	}
+}
+
+func doltInstallHint(goos string) string {
+	if goos == "darwin" {
+		return "brew install dolt"
+	}
+	return "Install Dolt from " + deps.DoltInstallURL
+}
+
+func doltUpgradeHint(goos string) string {
+	if goos == "darwin" {
+		return "brew upgrade dolt"
+	}
+	return "Upgrade Dolt using your package manager or reinstall from " + deps.DoltInstallURL
+}
+
+func doltReinstallHint(goos string) string {
+	if goos == "darwin" {
+		return "brew reinstall dolt"
+	}
+	return "Reinstall Dolt from " + deps.DoltInstallURL
 }
 
 // createTownRootAgentMDs creates a minimal, non-role-specific CLAUDE.md at the
@@ -559,9 +659,25 @@ func writeJSON(path string, data interface{}) error {
 // buildBdInitArgs returns the arguments for `bd init` including the correct
 // --server-port derived from the town's Dolt configuration.
 func buildBdInitArgs(townPath string) []string {
-	cfg := doltserver.DefaultConfig(townPath)
+	cfg := bdInitDoltConfig(townPath)
+	// gt install --force preserves town state; bd reinit flags would destroy town beads.
 	return []string{"init", "--prefix", "hq", "--server",
 		"--server-port", strconv.Itoa(cfg.Port)}
+}
+
+func bdInitDoltConfig(townPath string) *doltserver.Config {
+	cfg := doltserver.DefaultConfig(townPath)
+	// bd init targets durable town configuration. Keep non-endpoint defaults from
+	// DefaultConfig, but do not let ambient endpoint env override target config.
+	cfg.Host = ""
+	if host := config.ResolveConfiguredDoltHost(townPath); host != "" {
+		cfg.Host = host
+	}
+	cfg.Port = doltserver.DefaultPort
+	if port := config.ResolveConfiguredDoltPort(townPath); port > 0 {
+		cfg.Port = port
+	}
+	return cfg
 }
 
 // initTownBeads initializes town-level beads database using bd init.
@@ -571,8 +687,9 @@ func initTownBeads(townPath string) error {
 	// Dolt server is required — wait for it to accept queries before proceeding.
 	// The server may have just been started by gt install and TCP reachability
 	// alone is not sufficient; we need MySQL protocol readiness.
-	cfg := doltserver.DefaultConfig(townPath)
-	dsn := fmt.Sprintf("%s@tcp(%s)/", cfg.User, cfg.HostPort())
+	cfg := bdInitDoltConfig(townPath)
+	// wa-d6f: socket-first DSN (TCP fallback) — same rationale.
+	dsn := buildDoltDSNFromConfig(cfg, "", dsnOpts{})
 	var lastErr error
 	for attempt := 0; attempt < 20; attempt++ {
 		db, err := sql.Open("mysql", dsn)
@@ -591,13 +708,12 @@ func initTownBeads(townPath string) error {
 		return fmt.Errorf("Dolt server is not ready after 10s: %w", lastErr)
 	}
 
-	// Run: bd init --prefix hq --server
+	// Run: bd init --prefix hq --server --server-port <port>
 	// Dolt is the only backend since bd v0.51.0; no --backend flag needed.
 	// Filter inherited BEADS_DIR so bd init targets this town, not a parent .beads.
 	// Always pass --server-port so bd connects to the correct Dolt server.
-	// DefaultConfig resolves the port from config.yaml > GT_DOLT_PORT env > default (3307).
-	// Forward GT_DOLT_PORT so bd connects to the correct server when a
-	// non-default port is configured (e.g., ephemeral test servers in CI).
+	// bd init targets durable town config, so config.yaml beats ambient
+	// GT_DOLT_PORT that may be stale in long-lived agent sessions.
 	bdInitArgs := buildBdInitArgs(townPath)
 	cmd := exec.Command("bd", bdInitArgs...)
 	cmd.Dir = townPath
@@ -630,38 +746,22 @@ func initTownBeads(townPath string) error {
 		return fmt.Errorf("ensuring config.yaml: %w", err)
 	}
 
-	beadsEnv := withBeadsDirEnv(beadsDir)
-
-	// Set beads.role to maintainer (town-level beads are always maintainer-owned).
-	// Without this, bd doctor warns about missing role configuration.
-	roleSetCmd := exec.Command("bd", "config", "set", "beads.role", "maintainer")
-	roleSetCmd.Dir = townPath
-	roleSetCmd.Env = beadsEnv
-	if roleOutput, roleErr := roleSetCmd.CombinedOutput(); roleErr != nil {
-		fmt.Printf("   %s Could not set beads.role: %s\n", style.Dim.Render("⚠"), strings.TrimSpace(string(roleOutput)))
+	// Set beads.role to maintainer (town-level beads are always maintainer-owned)
+	// without invoking old bd config/schema initialization during fresh install.
+	if err := beads.EnsureConfigYAMLValue(beadsDir, "beads.role", "maintainer"); err != nil {
+		fmt.Printf("   %s Could not set beads.role: %v\n", style.Dim.Render("⚠"), err)
 	}
 
-	// Explicitly set issue_prefix config (bd init --prefix may not persist it in newer versions).
-	prefixSetCmd := exec.Command("bd", "config", "set", "issue_prefix", "hq")
-	prefixSetCmd.Dir = townPath
-	prefixSetCmd.Env = beadsEnv
-	if prefixOutput, prefixErr := prefixSetCmd.CombinedOutput(); prefixErr != nil {
-		return fmt.Errorf("bd config set issue_prefix failed: %s", strings.TrimSpace(string(prefixOutput)))
-	}
-
-	// Configure custom types for Gas Town (agent, role, rig, convoy, slot).
-	// These were extracted from beads core in v0.46.0 and now require explicit config.
-	if err := beads.EnsureCustomTypes(beadsDir); err != nil {
+	// Configure custom types for Gas Town before any bd config command can force
+	// an older bd binary through legacy schema initialization.
+	if err := beads.EnsureCustomTypesConfigYAML(beadsDir); err != nil {
 		return fmt.Errorf("ensuring custom types: %w", err)
 	}
 
 	// Configure allowed_prefixes for convoy beads (hq-cv-* IDs).
 	// This allows bd create --id=hq-cv-xxx to pass prefix validation.
-	prefixCmd := exec.Command("bd", "config", "set", "allowed_prefixes", "hq,hq-cv")
-	prefixCmd.Dir = townPath
-	prefixCmd.Env = beadsEnv
-	if prefixOutput, prefixErr := prefixCmd.CombinedOutput(); prefixErr != nil {
-		fmt.Printf("   %s Could not set allowed_prefixes: %s\n", style.Dim.Render("⚠"), strings.TrimSpace(string(prefixOutput)))
+	if err := beads.EnsureConfigYAMLValue(beadsDir, "allowed_prefixes", "hq,hq-cv"); err != nil {
+		fmt.Printf("   %s Could not set allowed_prefixes: %v\n", style.Dim.Render("⚠"), err)
 	}
 
 	// Ensure issues.jsonl exists — bd expects this file for git-tracked issue data.
@@ -688,30 +788,40 @@ func initTownBeads(townPath string) error {
 	return nil
 }
 
-// withBeadsDirEnv returns an environment with BEADS_DIR pinned to the target
-// beads directory and any inherited BEADS_DIR removed.
+// withBeadsDirEnv returns the hardened bd mutation environment pinned to the
+// target beads directory, with stale selectors stripped and canonical Dolt
+// endpoint aliases rebuilt from the shared helper.
 func withBeadsDirEnv(beadsDir string) []string {
-	env := os.Environ()
-	filtered := make([]string, 0, len(env)+1)
-	for _, e := range env {
-		if !strings.HasPrefix(e, "BEADS_DIR=") {
-			filtered = append(filtered, e)
+	base := os.Environ()
+	if townRoot := beads.FindTownRoot(filepath.Dir(beads.ResolveBeadsDir(beadsDir))); townRoot != "" {
+		base = config.NormalizeConfiguredDoltEnv(base, townRoot)
+		if host := config.ResolveConfiguredDoltHost(townRoot); host != "" {
+			base = beads.StripEnvKey(base, "GT_DOLT_HOST")
+			base = append(base, "GT_DOLT_HOST="+host)
+		}
+		if port := config.ResolveConfiguredDoltPort(townRoot); port > 0 {
+			base = beads.StripEnvKey(base, "GT_DOLT_PORT")
+			base = append(base, "GT_DOLT_PORT="+strconv.Itoa(port))
 		}
 	}
-	filtered = append(filtered, "BEADS_DIR="+beadsDir)
-	return filtered
+	return beads.BuildMutationPinnedBDEnv(base, beadsDir)
 }
 
-// ensureCustomTypes registers Gas Town custom issue types with beads.
+// ensureCustomTypes registers Gas Town issue type configuration with beads.
 // Beads core only supports built-in types (bug, feature, task, etc.).
-// Gas Town needs custom types: agent, role, rig, convoy, slot.
+// Gas Town needs custom types and keeps rig out of infra/wisp storage.
 // This is idempotent - safe to call multiple times.
 func ensureCustomTypes(beadsPath string) error {
-	cmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
-	cmd.Dir = beadsPath
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("bd config set types.custom: %s", strings.TrimSpace(string(output)))
+	for _, cfg := range []struct{ key, value string }{
+		{"types.custom", constants.BeadsCustomTypes},
+		{"types.infra", constants.BeadsInfraTypes},
+	} {
+		cmd := exec.Command("bd", "config", "set", cfg.key, cfg.value)
+		cmd.Dir = beadsPath
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("bd config set %s: %s", cfg.key, strings.TrimSpace(string(output)))
+		}
 	}
 	return nil
 }
@@ -736,7 +846,7 @@ func initTownAgentBeads(townPath string) error {
 	// bd init doesn't enable "custom" issue types by default, but Gas Town uses
 	// agent beads during install and runtime. Ensure these types are enabled
 	// before attempting to create any town-level system beads.
-	if err := ensureBeadsCustomTypes(townPath, constants.BeadsCustomTypesList()); err != nil {
+	if err := beads.EnsureCustomTypesConfigYAML(beads.ResolveBeadsDir(townPath)); err != nil {
 		return err
 	}
 
@@ -798,11 +908,16 @@ func ensureBeadsCustomTypes(workDir string, types []string) error {
 		return nil
 	}
 
-	cmd := exec.Command("bd", "config", "set", "types.custom", strings.Join(types, ","))
-	cmd.Dir = workDir
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("bd config set types.custom failed: %s", strings.TrimSpace(string(output)))
+	for _, cfg := range []struct{ key, value string }{
+		{"types.custom", strings.Join(types, ",")},
+		{"types.infra", constants.BeadsInfraTypes},
+	} {
+		cmd := exec.Command("bd", "config", "set", cfg.key, cfg.value)
+		cmd.Dir = workDir
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("bd config set %s failed: %s", cfg.key, strings.TrimSpace(string(output)))
+		}
 	}
 	return nil
 }

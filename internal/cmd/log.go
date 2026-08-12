@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/townlog"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -238,6 +239,8 @@ func printEvent(e townlog.Event) {
 		typeStr = style.Dim.Render("[nudge]")
 	case townlog.EventHandoff:
 		typeStr = style.Bold.Render("[handoff]")
+	case townlog.EventHandoffNoPersist:
+		typeStr = style.Error.Render("[handoff-NOPERSIST]")
 	case townlog.EventDone:
 		typeStr = style.Success.Render("[done]")
 	case townlog.EventCrash:
@@ -287,6 +290,11 @@ func formatEventDetail(e townlog.Event) string {
 			return fmt.Sprintf("handed off (%s)", e.Context)
 		}
 		return "handed off"
+	case townlog.EventHandoffNoPersist:
+		if e.Context != "" {
+			return fmt.Sprintf("handoff FAILED (%s)", e.Context)
+		}
+		return "handoff FAILED (no persist)"
 	case townlog.EventDone:
 		if e.Context != "" {
 			return fmt.Sprintf("completed %s", e.Context)
@@ -392,8 +400,33 @@ func runLogCrash(cmd *cobra.Command, args []string) error {
 	if err := logger.Log(eventType, crashAgent, context); err != nil {
 		return fmt.Errorf("logging event: %w", err)
 	}
+	if eventType == townlog.EventCrash {
+		logCrashFeedEvent(townRoot, crashAgent, crashSession, crashExitCode)
+	}
 
 	return nil
+}
+
+func logCrashFeedEvent(townRoot, agent, session string, exitCode int) {
+	if townRoot == "" {
+		return
+	}
+	if session == "" {
+		session = "unknown"
+	}
+
+	origDir, getwdErr := os.Getwd()
+	if err := os.Chdir(townRoot); err != nil {
+		return
+	}
+	if getwdErr == nil {
+		defer func() { _ = os.Chdir(origDir) }()
+	}
+
+	reason := fmt.Sprintf("crashed with exit code %d", exitCode)
+	payload := events.SessionDeathPayload(session, agent, reason, "gt log crash")
+	payload["exit_code"] = exitCode
+	_ = events.LogFeed(events.TypeSessionDeath, agent, payload)
 }
 
 // LogEvent is a helper that logs an event from anywhere in the codebase.
@@ -437,6 +470,17 @@ func LogNudge(townRoot, agent, message string) error {
 // LogHandoff logs a handoff event.
 func LogHandoff(townRoot, agent, context string) error {
 	return LogEventWithRoot(townRoot, townlog.EventHandoff, agent, context)
+}
+
+// LogHandoffNoPersist logs a failed handoff where Dolt persistence failed.
+// Creates a distinct marker in town.log so crash recovery can identify
+// handoffs that were attempted but never persisted to Dolt.
+func LogHandoffNoPersist(townRoot, agent, context string, persistErr error) error {
+	msg := context
+	if persistErr != nil {
+		msg = fmt.Sprintf("%s — error: %v", context, persistErr)
+	}
+	return LogEventWithRoot(townRoot, townlog.EventHandoffNoPersist, agent, msg)
 }
 
 // LogDone logs a done event.

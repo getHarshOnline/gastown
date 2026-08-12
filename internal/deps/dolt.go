@@ -7,11 +7,13 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // MinDoltVersion is the minimum compatible dolt version for this Gas Town release.
 // Update this when Gas Town requires new dolt features.
-const MinDoltVersion = "1.82.4"
+const MinDoltVersion = "2.0.7"
 
 // DoltInstallURL is the installation page for dolt.
 const DoltInstallURL = "https://github.com/dolthub/dolt#installation"
@@ -39,6 +41,7 @@ func CheckDolt() (DoltStatus, string, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, "version")
+	util.SetDetachedProcessGroup(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		detail := strings.TrimSpace(string(output))

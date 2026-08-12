@@ -53,11 +53,14 @@ switch ($cmd) {
     if ($args.Length -ge 3 -and $args[1] -eq 'get' -and $args[2] -eq 'status.custom') {
       Write-Output ''
     }
-    if ($args.Length -ge 3 -and $args[1] -eq 'get' -and $args[2] -eq 'types.custom') {
-      Write-Output 'agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request'
-    }
-    exit 0
-  }
+			if ($args.Length -ge 3 -and $args[1] -eq 'get' -and $args[2] -eq 'types.custom') {
+			  Write-Output 'agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request'
+			}
+			if ($args.Length -ge 3 -and $args[1] -eq 'get' -and $args[2] -eq 'types.infra') {
+			  Write-Output 'agent,role,message'
+			}
+			exit 0
+		  }
   'migrate' { exit 0 }
   default { exit 0 }
 }
@@ -95,12 +98,14 @@ case "$cmd" in
     printf 'prefix: %s\nissue-prefix: %s-\n' "$prefix" "$prefix" > "$target/config.yaml"
     exit 0
     ;;
-  config)
-    # Return types list for "config get types.custom" verification
-    if echo "$*" | grep -q "get types.custom"; then
-      echo "agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request"
-    fi
-    exit 0
+	  config)
+	    # Return types list for "config get types.custom" verification
+	    if echo "$*" | grep -q "get types.custom"; then
+	      echo "agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request"
+	    elif echo "$*" | grep -q "get types.infra"; then
+	      echo "agent,role,message"
+	    fi
+	    exit 0
     ;;
   migrate)
     exit 0
@@ -149,6 +154,21 @@ func TestFindTownRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Create a nested rig that was originally a standalone town
+	// (has its own mayor/town.json inside the outer town)
+	rigDir := filepath.Join(tmpDir, "myrig", "mayor", "rig")
+	rigMayorDir := filepath.Join(rigDir, "mayor")
+	if err := os.MkdirAll(rigMayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigMayorDir, "town.json"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	rigBeadsDir := filepath.Join(rigDir, ".beads")
+	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
 	tests := []struct {
 		name     string
 		startDir string
@@ -158,7 +178,27 @@ func TestFindTownRoot(t *testing.T) {
 		{"from mayor dir", mayorDir, tmpDir},
 		{"from deep nested dir", deepDir, tmpDir},
 		{"from non-town dir", t.TempDir(), ""},
+		{"nested town prefers outermost", rigBeadsDir, tmpDir},
+		{"nested rig dir prefers outermost", rigDir, tmpDir},
 	}
+
+	// Add nested town test case: inner town inside outer town
+	innerTown := filepath.Join(tmpDir, "imported", "gastown")
+	if err := os.MkdirAll(filepath.Join(innerTown, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(innerTown, "mayor", "town.json"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	innerDeepDir := filepath.Join(innerTown, "crew", "worker2")
+	if err := os.MkdirAll(innerDeepDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	tests = append(tests, struct {
+		name     string
+		startDir string
+		expected string
+	}{"prefers outermost town root", innerDeepDir, tmpDir})
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -277,10 +317,9 @@ func TestEnsureCustomTypes(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Create sentinel file with current types list
-		currentTypes := strings.Join(constants.BeadsCustomTypesList(), ",")
+		// Create sentinel file with current type config.
 		sentinelPath := filepath.Join(beadsDir, typesSentinel)
-		if err := os.WriteFile(sentinelPath, []byte(currentTypes+"\n"), 0644); err != nil {
+		if err := os.WriteFile(sentinelPath, []byte(TypeConfigSentinelValue()+"\n"), 0644); err != nil {
 			t.Fatal(err)
 		}
 
@@ -315,12 +354,46 @@ func TestEnsureCustomTypes(t *testing.T) {
 			t.Fatalf("EnsureCustomTypes: %v", err)
 		}
 
-		if got := strings.TrimSpace(string(mustReadFile(t, sentinelPath))); got != strings.Join(constants.BeadsCustomTypesList(), ",") {
-			t.Fatalf("types sentinel = %q, want current configured types", got)
+		if got := strings.TrimSpace(string(mustReadFile(t, sentinelPath))); got != TypeConfigSentinelValue() {
+			t.Fatalf("types sentinel = %q, want current type config", got)
 		}
 
 		logOutput := readMockBDLog(t, logPath)
-		for _, want := range []string{"init", "config set types.custom"} {
+		for _, want := range []string{"init", "config set types.custom", "config set types.infra"} {
+			if !strings.Contains(logOutput, want) {
+				t.Fatalf("mock bd log %q missing %q", logOutput, want)
+			}
+		}
+	})
+
+	t.Run("custom-types-only sentinel triggers infra re-configuration", func(t *testing.T) {
+		logPath := installMockBDRecorder(t)
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// This was the real pre-fix sentinel format. It must be stale so existing
+		// databases receive the durable-rig infra config.
+		sentinelPath := filepath.Join(beadsDir, typesSentinel)
+		legacyValue := strings.Join(constants.BeadsCustomTypesList(), ",")
+		if err := os.WriteFile(sentinelPath, []byte(legacyValue+"\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		ResetEnsuredDirs()
+
+		if err := EnsureCustomTypes(beadsDir); err != nil {
+			t.Fatalf("EnsureCustomTypes: %v", err)
+		}
+
+		if got := strings.TrimSpace(string(mustReadFile(t, sentinelPath))); got != TypeConfigSentinelValue() {
+			t.Fatalf("types sentinel = %q, want current type config", got)
+		}
+
+		logOutput := readMockBDLog(t, logPath)
+		for _, want := range []string{"config set types.custom", "config set types.infra"} {
 			if !strings.Contains(logOutput, want) {
 				t.Fatalf("mock bd log %q missing %q", logOutput, want)
 			}
@@ -334,10 +407,9 @@ func TestEnsureCustomTypes(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Create sentinel with current types to avoid bd call
-		currentTypes := strings.Join(constants.BeadsCustomTypesList(), ",")
+		// Create sentinel with current type config to avoid bd call.
 		sentinelPath := filepath.Join(beadsDir, typesSentinel)
-		if err := os.WriteFile(sentinelPath, []byte(currentTypes+"\n"), 0644); err != nil {
+		if err := os.WriteFile(sentinelPath, []byte(TypeConfigSentinelValue()+"\n"), 0644); err != nil {
 			t.Fatal(err)
 		}
 
@@ -357,8 +429,71 @@ func TestEnsureCustomTypes(t *testing.T) {
 	})
 }
 
+func TestEnsureCustomTypesConfigYAML(t *testing.T) {
+	ResetEnsuredDirs()
+
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureCustomTypesConfigYAML(beadsDir); err != nil {
+		t.Fatalf("EnsureCustomTypesConfigYAML: %v", err)
+	}
+
+	config := string(mustReadFile(t, filepath.Join(beadsDir, "config.yaml")))
+	for _, want := range []string{
+		"types.custom: " + strings.Join(constants.BeadsCustomTypesList(), ","),
+		"types.infra: " + strings.Join(constants.BeadsInfraTypesList(), ","),
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("config.yaml missing %q in:\n%s", want, config)
+		}
+	}
+	if strings.Contains(config, "types.infra: agent,role,rig,message") {
+		t.Fatalf("config.yaml kept rig in infra types:\n%s", config)
+	}
+
+	if _, err := os.Stat(filepath.Join(beadsDir, typesSentinel)); !os.IsNotExist(err) {
+		t.Fatalf("YAML-only type config must not write DB-verified sentinel, stat err: %v", err)
+	}
+}
+
+func TestEnsureCustomTypesConfigYAMLIgnoresDBCache(t *testing.T) {
+	ResetEnsuredDirs()
+
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	ensuredMu.Lock()
+	ensuredDirs[beadsDir] = true
+	ensuredMu.Unlock()
+	t.Cleanup(ResetEnsuredDirs)
+
+	if err := EnsureCustomTypesConfigYAML(beadsDir); err != nil {
+		t.Fatalf("EnsureCustomTypesConfigYAML: %v", err)
+	}
+
+	config := string(mustReadFile(t, filepath.Join(beadsDir, "config.yaml")))
+	for _, want := range []string{
+		"types.custom: " + strings.Join(constants.BeadsCustomTypesList(), ","),
+		"types.infra: " + strings.Join(constants.BeadsInfraTypesList(), ","),
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("config.yaml missing %q in:\n%s", want, config)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(beadsDir, typesSentinel)); !os.IsNotExist(err) {
+		t.Fatalf("YAML-only type config must not write DB-verified sentinel, stat err: %v", err)
+	}
+}
+
 func TestEnsureCustomTypes_VerifyPersistence(t *testing.T) {
 	t.Run("sentinel not written when db verify fails", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("test uses Unix shell script mock for bd")
+		}
 		// Install a mock bd that succeeds on "config set" but returns empty
 		// on "config get types.custom" — simulating a silent write failure.
 		binDir := t.TempDir()
@@ -547,6 +682,102 @@ func TestEnsureCustomStatuses(t *testing.T) {
 			t.Error("statuses cache key should not collide with types cache key")
 		}
 	})
+
+	// Regression for gt-kbi: when `bd config get status.custom` returns the
+	// unset sentinel "status.custom (not set)", EnsureCustomStatuses must NOT
+	// merge that literal string into the value passed to `bd config set` —
+	// bd rejects it via the [a-z][a-z0-9_-]* validator, breaking gt convoy.
+	t.Run("unset sentinel from bd config get is filtered (gt-kbi)", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("test uses Unix shell script mock for bd")
+		}
+
+		binDir := t.TempDir()
+		logPath := filepath.Join(binDir, "bd.log")
+		script := `#!/bin/sh
+LOG_FILE='` + logPath + `'
+printf '%s\n' "$*" >> "$LOG_FILE"
+
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) cmd="$arg"; break ;;
+  esac
+done
+
+case "$cmd" in
+  init)
+    target="${BEADS_DIR:-$(pwd)/.beads}"
+    mkdir -p "$target/dolt"
+    printf 'prefix: gt\nissue-prefix: gt-\n' > "$target/config.yaml"
+    exit 0
+    ;;
+  config)
+    # Simulate the real bd behaviour for an unset key: stdout carries the
+    # "<key> (not set)" sentinel and exit status is 0.
+    if echo "$*" | grep -q "get status.custom"; then
+      echo "status.custom (not set)"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+		if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+			t.Fatalf("write mock bd: %v", err)
+		}
+		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		ResetEnsuredDirs()
+
+		if err := EnsureCustomStatuses(beadsDir); err != nil {
+			t.Fatalf("EnsureCustomStatuses: %v", err)
+		}
+
+		logOutput := readMockBDLog(t, logPath)
+		if strings.Contains(logOutput, "(not set)") {
+			t.Fatalf("bd config set received the unset sentinel as a status value:\n%s", logOutput)
+		}
+
+		// Verify the set call carries exactly the canonical statuses list.
+		want := "config set status.custom " + strings.Join(constants.BeadsCustomStatusesList(), ",")
+		if !strings.Contains(logOutput, want) {
+			t.Fatalf("bd config set missing canonical statuses\nwant substring: %q\ngot:\n%s", want, logOutput)
+		}
+	})
+}
+
+func TestParseConfigOutput(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"empty", "", ""},
+		{"only whitespace", "  \n  \n", ""},
+		{"plain value", "agent,role,rig\n", "agent,role,rig"},
+		{"value after Note prefix", "Note: background sync off\nagent,role\n", "agent,role"},
+		{"value after multiple Note prefixes", "Note: a\nNote: b\nagent\n", "agent"},
+		{"unset sentinel filtered", "status.custom (not set)\n", ""},
+		{"unset sentinel followed by value", "status.custom (not set)\nstaged_ready\n", "staged_ready"},
+		{"Note prefix is case-sensitive", "note: lower-case\n", "note: lower-case"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ParseConfigOutput([]byte(tt.input)); got != tt.want {
+				t.Errorf("ParseConfigOutput(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestEnsureDatabaseInitialized(t *testing.T) {

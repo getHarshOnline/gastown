@@ -13,18 +13,19 @@ import (
 // AttachmentFields holds the attachment info for pinned beads.
 // These fields track which molecule is attached to a handoff/pinned bead.
 type AttachmentFields struct {
-	AttachedMolecule string // Root issue ID of the attached molecule
-	AttachedFormula  string // Formula name (e.g., "mol-polecat-work") for inline step display
-	AttachedAt       string // ISO 8601 timestamp when attached
-	AttachedArgs     string // Natural language args passed via gt sling --args (no-tmux mode)
+	AttachedMolecule string   // Root issue ID of the attached molecule
+	AttachedFormula  string   // Formula name (e.g., "mol-polecat-work") for inline step display
+	AttachedAt       string   // ISO 8601 timestamp when attached
+	AttachedArgs     string   // Natural language args passed via gt sling --args (no-tmux mode)
 	AttachedVars     []string // Formula variables passed via gt sling --var
-	DispatchedBy     string // Agent ID that dispatched this work (for completion notification)
-	NoMerge          bool   // If true, gt done skips merge queue (for upstream PRs/human review)
-	Mode             string // Execution mode: "" (normal) or "ralph" (Ralph Wiggum loop)
-	ConvoyID         string // Convoy bead ID tracking this issue (e.g., "hq-cv-abc")
-	MergeStrategy    string // Convoy merge strategy: "direct", "mr", "local", or "" (default = mr)
-	ConvoyOwned      bool   // If true, convoy has gt:owned label (caller-managed lifecycle)
-	FormulaVars      string // Newline-separated key=value pairs for formula template substitution
+	DispatchedBy     string   // Agent ID that dispatched this work (for completion notification)
+	NoMerge          bool     // If true, gt done skips merge queue (for upstream PRs/human review)
+	ReviewOnly       bool     // If true, assignee must evaluate and report back — no merge/commit/push
+	Mode             string   // Execution mode: "" (normal) or "ralph" (Ralph Wiggum loop)
+	ConvoyID         string   // Convoy bead ID tracking this issue (e.g., "hq-cv-abc")
+	MergeStrategy    string   // Convoy merge strategy: "direct", "mr", "local", or "" (default = mr)
+	ConvoyOwned      bool     // If true, convoy has gt:owned label (caller-managed lifecycle)
+	FormulaVars      string   // Newline-separated key=value pairs for formula template substitution
 }
 
 // ParseAttachmentFields extracts attachment fields from an issue's description.
@@ -36,6 +37,7 @@ func ParseAttachmentFields(issue *Issue) *AttachmentFields {
 
 	fields := &AttachmentFields{}
 	hasFields := false
+	var formulaVars []string
 
 	for _, line := range strings.Split(issue.Description, "\n") {
 		line = strings.TrimSpace(line)
@@ -78,6 +80,9 @@ func ParseAttachmentFields(issue *Issue) *AttachmentFields {
 		case "no_merge", "no-merge", "nomerge":
 			fields.NoMerge = strings.ToLower(value) == "true"
 			hasFields = true
+		case "review_only", "review-only", "reviewonly":
+			fields.ReviewOnly = strings.ToLower(value) == "true"
+			hasFields = true
 		case "mode":
 			fields.Mode = value
 			hasFields = true
@@ -91,9 +96,12 @@ func ParseAttachmentFields(issue *Issue) *AttachmentFields {
 			fields.ConvoyOwned = strings.ToLower(value) == "true"
 			hasFields = true
 		case "formula_vars", "formula-vars", "formulavars":
-			fields.FormulaVars = value
+			formulaVars = append(formulaVars, splitFormulaVars(parseFormulaVars(value))...)
 			hasFields = true
 		}
+	}
+	if len(formulaVars) > 0 {
+		fields.FormulaVars = strings.Join(formulaVars, "\n")
 	}
 
 	if !hasFields {
@@ -132,6 +140,9 @@ func FormatAttachmentFields(fields *AttachmentFields) string {
 	if fields.NoMerge {
 		lines = append(lines, "no_merge: true")
 	}
+	if fields.ReviewOnly {
+		lines = append(lines, "review_only: true")
+	}
 	if fields.Mode != "" {
 		lines = append(lines, "mode: "+fields.Mode)
 	}
@@ -145,7 +156,9 @@ func FormatAttachmentFields(fields *AttachmentFields) string {
 		lines = append(lines, "convoy_owned: true")
 	}
 	if fields.FormulaVars != "" {
-		lines = append(lines, "formula_vars: "+fields.FormulaVars)
+		if formatted := formatFormulaVars(fields.FormulaVars); formatted != "" {
+			lines = append(lines, "formula_vars: "+formatted)
+		}
 	}
 
 	return strings.Join(lines, "\n")
@@ -178,6 +191,9 @@ func SetAttachmentFields(issue *Issue, fields *AttachmentFields) string {
 		"no_merge":          true,
 		"no-merge":          true,
 		"nomerge":           true,
+		"review_only":       true,
+		"review-only":       true,
+		"reviewonly":        true,
 		"mode":              true,
 		"convoy_id":         true,
 		"convoy-id":         true,
@@ -245,11 +261,14 @@ func SetAttachmentFields(issue *Issue, fields *AttachmentFields) string {
 // ConvoyFields holds the structured fields for a convoy bead.
 // These fields are stored as key: value lines in the issue description.
 type ConvoyFields struct {
-	Owner      string // Convoy owner address (e.g., "mayor/")
-	Notify     string // Additional notification address
-	Molecule   string // Associated molecule/swarm ID
-	Merge      string // Merge strategy
-	BaseBranch string // Target branch for polecats (e.g., "feat/extraction-review")
+	Owner                string // Convoy owner address (e.g., "mayor/")
+	Notify               string // Additional notification address
+	Molecule             string // Associated molecule/swarm ID
+	Merge                string // Merge strategy
+	BaseBranch           string // Target branch for polecats (e.g., "feat/extraction-review")
+	Watchers             string // Comma-separated mail notification addresses (added via gt convoy watch)
+	NudgeWatchers        string // Comma-separated nudge notification addresses (added via gt convoy watch --nudge)
+	CompletionNotifiedAt string // RFC3339 timestamp when completion notifications were claimed/sent
 }
 
 // ParseConvoyFields extracts convoy fields from an issue's description.
@@ -295,6 +314,15 @@ func ParseConvoyFields(issue *Issue) *ConvoyFields {
 		case "base_branch", "base-branch", "basebranch":
 			fields.BaseBranch = value
 			hasFields = true
+		case "watchers":
+			fields.Watchers = value
+			hasFields = true
+		case "nudge_watchers", "nudge-watchers", "nudgewatchers":
+			fields.NudgeWatchers = value
+			hasFields = true
+		case "completion_notified_at", "completion-notified-at", "completionnotifiedat":
+			fields.CompletionNotifiedAt = value
+			hasFields = true
 		}
 	}
 
@@ -304,7 +332,8 @@ func ParseConvoyFields(issue *Issue) *ConvoyFields {
 	return fields
 }
 
-// NotificationAddresses returns deduplicated notification addresses from convoy fields.
+// NotificationAddresses returns deduplicated mail notification addresses from convoy fields.
+// Includes Owner, Notify, and all Watchers addresses.
 func (f *ConvoyFields) NotificationAddresses() []string {
 	if f == nil {
 		return nil
@@ -317,7 +346,109 @@ func (f *ConvoyFields) NotificationAddresses() []string {
 			seen[addr] = true
 		}
 	}
+	for _, addr := range splitWatchers(f.Watchers) {
+		if addr != "" && !seen[addr] {
+			addrs = append(addrs, addr)
+			seen[addr] = true
+		}
+	}
 	return addrs
+}
+
+// NudgeNotificationAddresses returns deduplicated nudge addresses from convoy fields.
+func (f *ConvoyFields) NudgeNotificationAddresses() []string {
+	if f == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var addrs []string
+	for _, addr := range splitWatchers(f.NudgeWatchers) {
+		if addr != "" && !seen[addr] {
+			addrs = append(addrs, addr)
+			seen[addr] = true
+		}
+	}
+	return addrs
+}
+
+// AddWatcher adds a mail watcher address to the comma-separated Watchers field.
+// Returns true if the address was added (false if already present).
+func (f *ConvoyFields) AddWatcher(addr string) bool {
+	existing := splitWatchers(f.Watchers)
+	for _, w := range existing {
+		if w == addr {
+			return false
+		}
+	}
+	existing = append(existing, addr)
+	f.Watchers = strings.Join(existing, ",")
+	return true
+}
+
+// AddNudgeWatcher adds a nudge watcher address to the comma-separated NudgeWatchers field.
+// Returns true if the address was added (false if already present).
+func (f *ConvoyFields) AddNudgeWatcher(addr string) bool {
+	existing := splitWatchers(f.NudgeWatchers)
+	for _, w := range existing {
+		if w == addr {
+			return false
+		}
+	}
+	existing = append(existing, addr)
+	f.NudgeWatchers = strings.Join(existing, ",")
+	return true
+}
+
+// RemoveWatcher removes a mail watcher address. Returns true if it was present.
+func (f *ConvoyFields) RemoveWatcher(addr string) bool {
+	existing := splitWatchers(f.Watchers)
+	var remaining []string
+	found := false
+	for _, w := range existing {
+		if w == addr {
+			found = true
+		} else {
+			remaining = append(remaining, w)
+		}
+	}
+	if found {
+		f.Watchers = strings.Join(remaining, ",")
+	}
+	return found
+}
+
+// RemoveNudgeWatcher removes a nudge watcher address. Returns true if it was present.
+func (f *ConvoyFields) RemoveNudgeWatcher(addr string) bool {
+	existing := splitWatchers(f.NudgeWatchers)
+	var remaining []string
+	found := false
+	for _, w := range existing {
+		if w == addr {
+			found = true
+		} else {
+			remaining = append(remaining, w)
+		}
+	}
+	if found {
+		f.NudgeWatchers = strings.Join(remaining, ",")
+	}
+	return found
+}
+
+// splitWatchers splits a comma-separated watcher string into trimmed, non-empty addresses.
+func splitWatchers(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	var result []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
 }
 
 // FormatConvoyFields formats ConvoyFields as a string suitable for an issue description.
@@ -342,6 +473,15 @@ func FormatConvoyFields(fields *ConvoyFields) string {
 	}
 	if fields.BaseBranch != "" {
 		lines = append(lines, "base_branch: "+fields.BaseBranch)
+	}
+	if fields.Watchers != "" {
+		lines = append(lines, "Watchers: "+fields.Watchers)
+	}
+	if fields.NudgeWatchers != "" {
+		lines = append(lines, "nudge_watchers: "+fields.NudgeWatchers)
+	}
+	if fields.CompletionNotifiedAt != "" {
+		lines = append(lines, "completion_notified_at: "+fields.CompletionNotifiedAt)
 	}
 
 	return strings.Join(lines, "\n")
@@ -371,6 +511,39 @@ func parseAttachedVars(raw string) []string {
 	return []string{raw}
 }
 
+func formatFormulaVars(raw string) string {
+	return formatAttachedVars(splitFormulaVars(raw))
+}
+
+func parseFormulaVars(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "[") {
+		if vars := parseAttachedVars(raw); len(vars) > 0 {
+			return strings.Join(vars, "\n")
+		}
+		return ""
+	}
+	return strings.Join(splitFormulaVars(raw), "\n")
+}
+
+func splitFormulaVars(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	vars := strings.Split(raw, "\n")
+	out := vars[:0]
+	for _, variable := range vars {
+		variable = strings.TrimSpace(variable)
+		if variable != "" {
+			out = append(out, variable)
+		}
+	}
+	return out
+}
+
 // SetConvoyFields updates an issue's description with the given convoy fields.
 // Existing convoy field lines are replaced; other content is preserved.
 // Returns the new description string.
@@ -381,13 +554,20 @@ func SetConvoyFields(issue *Issue, fields *ConvoyFields) string {
 
 	// Known convoy field keys (lowercase)
 	convoyKeys := map[string]bool{
-		"owner":       true,
-		"notify":      true,
-		"merge":       true,
-		"molecule":    true,
-		"base_branch": true,
-		"base-branch": true,
-		"basebranch":  true,
+		"owner":                  true,
+		"notify":                 true,
+		"merge":                  true,
+		"molecule":               true,
+		"base_branch":            true,
+		"base-branch":            true,
+		"basebranch":             true,
+		"watchers":               true,
+		"nudge_watchers":         true,
+		"nudge-watchers":         true,
+		"nudgewatchers":          true,
+		"completion_notified_at": true,
+		"completion-notified-at": true,
+		"completionnotifiedat":   true,
 	}
 
 	// Collect non-convoy lines from existing description
@@ -443,6 +623,9 @@ type MRFields struct {
 	SourceIssue string // The work item being merged (e.g., "gt-xyz")
 	Worker      string // Who did the work
 	Rig         string // Which rig
+	CommitSHA   string // HEAD commit SHA at submission time (GH#3032: dedup key)
+	PRURL       string // Recorded pull request URL, if one exists for this MR
+	PRNumber    int    // Recorded pull request number, scoped to the target repo
 	MergeCommit string // SHA of merge commit (set on close)
 	CloseReason string // Reason for closing: merged, rejected, conflict, superseded
 	AgentBead   string // Agent bead ID that created this MR (for traceability)
@@ -489,7 +672,7 @@ func ParseMRFields(issue *Issue) *MRFields {
 
 		key := strings.TrimSpace(line[:colonIdx])
 		value := strings.TrimSpace(line[colonIdx+1:])
-		if value == "" {
+		if value == "" || strings.EqualFold(value, "null") {
 			continue
 		}
 
@@ -510,6 +693,17 @@ func ParseMRFields(issue *Issue) *MRFields {
 		case "rig":
 			fields.Rig = value
 			hasFields = true
+		case "commit_sha", "commit-sha", "commitsha":
+			fields.CommitSHA = value
+			hasFields = true
+		case "pr_url", "pr-url", "prurl":
+			fields.PRURL = value
+			hasFields = true
+		case "pr_number", "pr-number", "prnumber":
+			if n, err := parseIntField(value); err == nil {
+				fields.PRNumber = n
+				hasFields = true
+			}
 		case "merge_commit", "merge-commit", "mergecommit":
 			fields.MergeCommit = value
 			hasFields = true
@@ -585,6 +779,15 @@ func FormatMRFields(fields *MRFields) string {
 	if fields.Rig != "" {
 		lines = append(lines, "rig: "+fields.Rig)
 	}
+	if fields.CommitSHA != "" {
+		lines = append(lines, "commit_sha: "+fields.CommitSHA)
+	}
+	if fields.PRURL != "" {
+		lines = append(lines, "pr_url: "+fields.PRURL)
+	}
+	if fields.PRNumber > 0 {
+		lines = append(lines, fmt.Sprintf("pr_number: %d", fields.PRNumber))
+	}
 	if fields.MergeCommit != "" {
 		lines = append(lines, "merge_commit: "+fields.MergeCommit)
 	}
@@ -632,47 +835,56 @@ func SetMRFields(issue *Issue, fields *MRFields) string {
 
 	// Known MR field keys (lowercase)
 	mrKeys := map[string]bool{
-		"branch":             true,
-		"target":             true,
-		"source_issue":       true,
-		"source-issue":       true,
-		"sourceissue":        true,
-		"worker":             true,
-		"rig":                true,
-		"merge_commit":       true,
-		"merge-commit":       true,
-		"mergecommit":        true,
-		"close_reason":       true,
-		"close-reason":       true,
-		"closereason":        true,
-		"agent_bead":         true,
-		"agent-bead":         true,
-		"agentbead":          true,
-		"retry_count":        true,
-		"retry-count":        true,
-		"retrycount":         true,
-		"last_conflict_sha":  true,
-		"last-conflict-sha":  true,
-		"lastconflictsha":    true,
-		"conflict_task_id":   true,
-		"conflict-task-id":   true,
-		"conflicttaskid":     true,
-		"convoy_id":          true,
-		"convoy-id":          true,
-		"convoyid":           true,
-		"convoy":             true,
-		"convoy_created_at":  true,
-		"convoy-created-at":  true,
-		"convoycreatedat":    true,
-		"pre_verified":       true,
-		"pre-verified":       true,
-		"preverified":        true,
-		"pre_verified_at":    true,
-		"pre-verified-at":    true,
-		"preverifiedat":      true,
-		"pre_verified_base":  true,
-		"pre-verified-base":  true,
-		"preverifiedbase":    true,
+		"branch":            true,
+		"target":            true,
+		"source_issue":      true,
+		"source-issue":      true,
+		"sourceissue":       true,
+		"worker":            true,
+		"rig":               true,
+		"commit_sha":        true,
+		"commit-sha":        true,
+		"commitsha":         true,
+		"pr_url":            true,
+		"pr-url":            true,
+		"prurl":             true,
+		"pr_number":         true,
+		"pr-number":         true,
+		"prnumber":          true,
+		"merge_commit":      true,
+		"merge-commit":      true,
+		"mergecommit":       true,
+		"close_reason":      true,
+		"close-reason":      true,
+		"closereason":       true,
+		"agent_bead":        true,
+		"agent-bead":        true,
+		"agentbead":         true,
+		"retry_count":       true,
+		"retry-count":       true,
+		"retrycount":        true,
+		"last_conflict_sha": true,
+		"last-conflict-sha": true,
+		"lastconflictsha":   true,
+		"conflict_task_id":  true,
+		"conflict-task-id":  true,
+		"conflicttaskid":    true,
+		"convoy_id":         true,
+		"convoy-id":         true,
+		"convoyid":          true,
+		"convoy":            true,
+		"convoy_created_at": true,
+		"convoy-created-at": true,
+		"convoycreatedat":   true,
+		"pre_verified":      true,
+		"pre-verified":      true,
+		"preverified":       true,
+		"pre_verified_at":   true,
+		"pre-verified-at":   true,
+		"preverifiedat":     true,
+		"pre_verified_base": true,
+		"pre-verified-base": true,
+		"preverifiedbase":   true,
 	}
 
 	// Collect non-MR lines from existing description

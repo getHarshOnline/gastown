@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/lock"
@@ -42,6 +43,27 @@ func (b *Beads) FindHandoffBead(role string) (*Issue, error) {
 	}
 
 	return nil, nil
+}
+
+// FindAllHandoffBeads fetches all pinned beads once and returns a map from
+// role name to handoff bead. This avoids the N+1 subprocess problem where
+// FindHandoffBead is called once per agent, each spawning a bd subprocess.
+func (b *Beads) FindAllHandoffBeads() (map[string]*Issue, error) {
+	issues, err := b.List(ListOptions{Status: StatusPinned, Priority: -1})
+	if err != nil {
+		return nil, fmt.Errorf("listing pinned issues: %w", err)
+	}
+
+	result := make(map[string]*Issue)
+	for _, issue := range issues {
+		// Handoff bead titles follow the pattern "<role> Handoff"
+		if strings.HasSuffix(issue.Title, " Handoff") {
+			role := strings.TrimSuffix(issue.Title, " Handoff")
+			result[role] = issue
+		}
+	}
+
+	return result, nil
 }
 
 // GetOrCreateHandoffBead returns the handoff bead for a role, creating it if needed.
@@ -163,6 +185,32 @@ func (b *Beads) ClearMail(reason string) (*ClearMailResult, error) {
 	}
 
 	return result, nil
+}
+
+// CloseStaleHookedMailBeads closes any gt:message beads in status=hooked assigned
+// to agentID. Called before creating a new handoff mail to prevent accumulation of
+// stale beads across sessions. Returns the number of beads closed. (GH#3859)
+func (b *Beads) CloseStaleHookedMailBeads(agentID string) (int, error) {
+	hooked, err := b.List(ListOptions{
+		Status:   StatusHooked,
+		Label:    "gt:message",
+		Assignee: agentID,
+		Priority: -1,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("listing hooked mail beads: %w", err)
+	}
+	if len(hooked) == 0 {
+		return 0, nil
+	}
+	ids := make([]string, len(hooked))
+	for i, h := range hooked {
+		ids[i] = h.ID
+	}
+	if err := b.ForceCloseWithReason("handoff: superseded by new session", ids...); err != nil {
+		return 0, err
+	}
+	return len(ids), nil
 }
 
 // lockBead acquires a cross-process advisory lock for a bead operation.

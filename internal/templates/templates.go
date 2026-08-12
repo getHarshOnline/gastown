@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"text/template"
 
@@ -44,6 +45,9 @@ var templateFS embed.FS
 //go:embed launchd/*.plist systemd/*.service
 var supervisorFS embed.FS
 
+//go:embed polecat-CLAUDE.md
+var polecatCLAUDEmd string
+
 // Templates manages role and message templates.
 type Templates struct {
 	roleTemplates    *template.Template
@@ -52,19 +56,21 @@ type Templates struct {
 
 // RoleData contains information for rendering role contexts.
 type RoleData struct {
-	Role           string   // mayor, witness, refinery, polecat, crew, deacon
-	RigName        string   // e.g., "greenplace"
-	TownRoot       string   // e.g., "/Users/steve/ai"
-	TownName       string   // e.g., "ai" - the town identifier for session names
-	WorkDir        string   // current working directory
-	DefaultBranch  string   // default branch for merges (e.g., "main", "develop")
-	Polecat        string   // polecat name (for polecat role)
-	Polecats       []string // list of polecats (for witness role)
-	DogName        string   // dog name (for dog role)
-	BeadsDir       string   // BEADS_DIR path
-	IssuePrefix    string   // beads issue prefix
-	MayorSession   string   // e.g., "gt-ai-mayor" - dynamic mayor session name
-	DeaconSession  string   // e.g., "gt-ai-deacon" - dynamic deacon session name
+	Role          string   // mayor, witness, refinery, polecat, crew, deacon
+	RigName       string   // e.g., "greenplace"
+	TownRoot      string   // e.g., "/Users/steve/ai"
+	TownName      string   // e.g., "ai" - the town identifier for session names
+	WorkDir       string   // current working directory
+	DefaultBranch string   // default branch for merges (e.g., "main", "develop")
+	IsForkRig     bool     // true when rig config has upstream_url
+	UpstreamURL   string   // redacted upstream URL for display only
+	Polecat       string   // polecat name (for polecat role)
+	Polecats      []string // list of polecats (for witness role)
+	DogName       string   // dog name (for dog role)
+	BeadsDir      string   // BEADS_DIR path
+	IssuePrefix   string   // beads issue prefix
+	MayorSession  string   // e.g., "gt-ai-mayor" - dynamic mayor session name
+	DeaconSession string   // e.g., "gt-ai-deacon" - dynamic deacon session name
 }
 
 // SpawnData contains information for spawn assignment messages.
@@ -205,6 +211,62 @@ func CreateMayorCLAUDEmd(mayorDir, townRoot, townName, mayorSession, deaconSessi
 		return false, err
 	}
 
+	return true, os.WriteFile(claudePath, []byte(content), 0644)
+}
+
+// PolecatLifecycleMarker is a unique string present in the polecat CLAUDE.md
+// template. Used to detect whether a CLAUDE.md file contains the Gas Town
+// overlay (vs. project-specific content). If an existing CLAUDE.md lacks this
+// marker, polecat lifecycle instructions are appended — the agent won't know
+// to call `gt done` otherwise.
+const PolecatLifecycleMarker = "IDLE POLECAT HERESY"
+
+// CreatePolecatCLAUDEmd writes the polecat CLAUDE.md template to the worktree.
+// This is the primary mechanism for polecats to learn about `gt done` and other
+// lifecycle commands — the file persists across compaction and session restarts.
+//
+// If the worktree already has a tracked CLAUDE.md (e.g., from the rig's repo),
+// polecat lifecycle instructions are written to CLAUDE.local.md instead. This
+// avoids creating uncommitted changes in the tracked CLAUDE.md, which the
+// gt done auto-save safety net would otherwise commit onto the polecat's branch,
+// polluting the PR diff with hundreds of lines of agent context.
+//
+// If no CLAUDE.md exists, the full template is written to CLAUDE.md.
+//
+// Returns (created bool, error).
+func CreatePolecatCLAUDEmd(worktreePath, rigName, polecatName string) (bool, error) {
+	claudePath := filepath.Join(worktreePath, "CLAUDE.md")
+	claudeLocalPath := filepath.Join(worktreePath, "CLAUDE.local.md")
+
+	// Render the polecat template with rig/name substitutions
+	content := polecatCLAUDEmd
+	content = strings.ReplaceAll(content, "{{rig}}", rigName)
+	content = strings.ReplaceAll(content, "{{name}}", polecatName)
+
+	// Check if lifecycle instructions are already present in either file.
+	for _, path := range []string{claudePath, claudeLocalPath} {
+		if existing, err := os.ReadFile(path); err == nil {
+			if strings.Contains(string(existing), PolecatLifecycleMarker) {
+				return false, nil // Already has our instructions
+			}
+		}
+	}
+
+	// If CLAUDE.md exists (tracked repo file), write to CLAUDE.local.md instead
+	// to avoid polluting the tracked file with polecat context. CLAUDE.local.md
+	// is gitignored in standard rig repos and is still loaded by Claude Code.
+	if _, err := os.Stat(claudePath); err == nil {
+		existingLocal, readErr := os.ReadFile(claudeLocalPath)
+		if readErr == nil {
+			// Append to existing CLAUDE.local.md
+			merged := string(existingLocal) + "\n---\n\n" + content
+			return true, os.WriteFile(claudeLocalPath, []byte(merged), 0644)
+		}
+		// Write new CLAUDE.local.md with just polecat context
+		return true, os.WriteFile(claudeLocalPath, []byte(content), 0644)
+	}
+
+	// No CLAUDE.md — write the full template there
 	return true, os.WriteFile(claudePath, []byte(content), 0644)
 }
 

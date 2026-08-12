@@ -9,6 +9,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -26,10 +27,11 @@ type tmuxOps interface {
 	IsAgentAlive(session string) bool
 	KillSessionWithProcesses(name string) error
 	NewSessionWithCommand(name, workDir, command string) error
+	NewSessionWithCommandAndEnv(name, workDir, command string, env map[string]string) error
 	SetRemainOnExit(pane string, on bool) error
 	SetEnvironment(session, key, value string) error
 	GetPaneID(session string) (string, error)
-	ConfigureGasTownSession(session string, theme tmux.Theme, rig, worker, role string) error
+	ConfigureGasTownSession(session string, theme *tmux.Theme, rig, worker, role string) error
 	WaitForCommand(session string, excludeCommands []string, timeout time.Duration) error
 	SetAutoRespawnHook(session string) error
 	AcceptStartupDialogs(session string) error
@@ -41,15 +43,19 @@ type tmuxOps interface {
 
 // Manager handles deacon lifecycle operations.
 type Manager struct {
-	townRoot string
-	tmux     tmuxOps
+	townRoot    string
+	tmux        tmuxOps
+	startPoller func(townRoot, session string) (int, error)
+	stopPoller  func(townRoot, session string) error
 }
 
 // NewManager creates a new deacon manager for a town.
 func NewManager(townRoot string) *Manager {
 	return &Manager{
-		townRoot: townRoot,
-		tmux:     tmux.NewTmux(),
+		townRoot:    townRoot,
+		tmux:        tmux.NewTmux(),
+		startPoller: nudge.StartPoller,
+		stopPoller:  nudge.StopPoller,
 	}
 }
 
@@ -69,6 +75,24 @@ func (m *Manager) deaconDir() string {
 	return filepath.Join(m.townRoot, "deacon")
 }
 
+func (m *Manager) startNudgePoller(sessionID string) {
+	if m.startPoller == nil {
+		return
+	}
+	if _, pollerErr := m.startPoller(m.townRoot, sessionID); pollerErr != nil {
+		fmt.Printf("warning: could not start nudge poller for %s: %v\n", sessionID, pollerErr)
+	}
+}
+
+func (m *Manager) stopNudgePoller(sessionID string) {
+	if m.stopPoller == nil {
+		return
+	}
+	if pollerErr := m.stopPoller(m.townRoot, sessionID); pollerErr != nil {
+		fmt.Printf("warning: could not stop nudge poller for %s: %v\n", sessionID, pollerErr)
+	}
+}
+
 // Start starts the deacon session.
 // agentOverride allows specifying an alternate agent alias (e.g., for testing).
 // Restarts are handled by daemon via ensureDeaconRunning on each heartbeat.
@@ -81,6 +105,7 @@ func (m *Manager) Start(agentOverride string) error {
 	if running {
 		// Session exists - check if agent is actually running (healthy vs zombie)
 		if t.IsAgentAlive(sessionID) {
+			m.startNudgePoller(sessionID)
 			return ErrAlreadyRunning
 		}
 
@@ -88,6 +113,7 @@ func (m *Manager) Start(agentOverride string) error {
 		// The auto-respawn hook (SetAutoRespawnHook) handles clean exits at the
 		// tmux level — Go doesn't need to distinguish dead pane vs zombie shell.
 		// Use KillSessionWithProcesses to ensure all descendant processes are killed.
+		m.stopNudgePoller(sessionID)
 		if err := t.KillSessionWithProcesses(sessionID); err != nil {
 			return fmt.Errorf("killing zombie session: %w", err)
 		}
@@ -109,7 +135,7 @@ func (m *Manager) Start(agentOverride string) error {
 		Recipient: "deacon",
 		Sender:    "daemon",
 		Topic:     "patrol",
-	}, "I am Deacon. Start patrol: run gt deacon heartbeat, then check gt hook. If no hook, create mol-deacon-patrol wisp and execute it.")
+	}, "I am Deacon. Start patrol: run gt deacon heartbeat, then check gt hook. If no hook, run gt sling mol-deacon-patrol deacon, then execute the hook it creates.")
 	startupCmd, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
 		Role:        "deacon",
 		TownRoot:    m.townRoot,
@@ -121,9 +147,21 @@ func (m *Manager) Start(agentOverride string) error {
 		return fmt.Errorf("building startup command: %w", err)
 	}
 
-	// Create session with command directly to avoid send-keys race condition.
-	// See: https://github.com/anthropics/gastown/issues/280
-	if err := t.NewSessionWithCommand(sessionID, deaconDir, startupCmd); err != nil {
+	// Compute env vars BEFORE session creation so they reach Claude's
+	// subprocesses (e.g., bd) via tmux -e flags. SetEnvironment after creation
+	// only affects newly spawned panes, not the running pane's tree (gt-neycp).
+	envVars := config.AgentEnv(config.AgentEnvConfig{
+		Role:        "deacon",
+		TownRoot:    m.townRoot,
+		Agent:       agentOverride,
+		SessionName: sessionID,
+	})
+	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
+
+	// Create session with command and env vars via -e flags so the initial
+	// shell (and subprocesses Claude spawns) inherit them from the start.
+	// See: https://github.com/anthropics/gastown/issues/280 (race condition fix)
+	if err := t.NewSessionWithCommandAndEnv(sessionID, deaconDir, startupCmd, envVars); err != nil {
 		return fmt.Errorf("creating tmux session: %w", err)
 	}
 
@@ -132,26 +170,13 @@ func (m *Manager) Start(agentOverride string) error {
 	// The pane will show "[Exited]" status but remain available for respawn.
 	_ = t.SetRemainOnExit(sessionID, true)
 
-	// Set environment variables (non-fatal: session works without these)
-	// Use centralized AgentEnv for consistency across all role startup paths
-	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:        "deacon",
-		TownRoot:    m.townRoot,
-		Agent:       agentOverride,
-		SessionName: sessionID,
-	})
-	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
-	for k, v := range envVars {
-		_ = t.SetEnvironment(sessionID, k, v)
-	}
-
 	// Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
 	if paneID, err := t.GetPaneID(sessionID); err == nil {
 		_ = t.SetEnvironment(sessionID, "GT_PANE_ID", paneID)
 	}
 
 	// Apply Deacon theming (non-fatal: theming failure doesn't affect operation)
-	theme := tmux.DeaconTheme()
+	theme := tmux.ResolveSessionTheme(m.townRoot, "", "deacon", "")
 	_ = t.ConfigureGasTownSession(sessionID, theme, "", "Deacon", "health-check")
 
 	// Wait for Claude to start - fatal if Claude fails to launch
@@ -178,6 +203,7 @@ func (m *Manager) Start(agentOverride string) error {
 
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear.
 	_ = t.AcceptStartupDialogs(sessionID)
+	m.startNudgePoller(sessionID)
 
 	time.Sleep(constants.ShutdownNotifyDelay)
 
@@ -197,6 +223,8 @@ func (m *Manager) Stop() error {
 	if !running {
 		return ErrNotRunning
 	}
+
+	m.stopNudgePoller(sessionID)
 
 	// Try graceful shutdown first (best-effort interrupt)
 	_ = t.SendKeysRaw(sessionID, "C-c")

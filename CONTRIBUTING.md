@@ -9,6 +9,48 @@ Thanks for your interest in contributing! Gas Town is experimental software, and
 3. Install prerequisites (see README.md)
 4. Build and test: `go build -o gt ./cmd/gt && go test ./...`
 
+## Setting up a rig to contribute to Gas Town
+
+If you run a Gas Town rig against this repo, you don't own the canonical
+repository, so the rig must **fetch from upstream but push to your fork**.
+`gt rig add` has first-class support for this through `--push-url` and
+`--upstream-url`.
+
+1. Fork `gastownhall/gastown` on GitHub (gives you
+   `https://github.com/<you>/gastown`).
+2. Add the rig with fork routing:
+
+   ```bash
+   gt rig add gastown https://github.com/gastownhall/gastown \
+     --push-url     https://github.com/<you>/gastown \
+     --upstream-url https://github.com/gastownhall/gastown
+   ```
+
+What each flag does at the git-remote level:
+
+- The positional `<git-url>` (`https://github.com/gastownhall/gastown`)
+  becomes `origin`'s **fetch** URL — the rig pulls canonical history from
+  upstream.
+- `--push-url` sets `origin`'s **push** URL to your fork, so all pushes land
+  on `https://github.com/<you>/gastown` and never on the canonical repo.
+- `--upstream-url` adds a separate named `upstream` remote pointing at the
+  canonical repo, so rebases against `upstream/main` work without juggling
+  URLs.
+
+> **Current limitation — the refinery is not yet fork-aware.** Until the
+> behavioral half of
+> [gastownhall/gastown#1794](https://github.com/gastownhall/gastown/issues/1794)
+> ships, even a correctly-configured fork rig will have its refinery attempt
+> to **merge polecat branches into the fork's `main`**, diverging it from
+> upstream. If you want strict PR-only behavior, do not start the refinery
+> (park the rig with `gt rig park <rig>`) and use the
+> polecat → branch → manual PR path instead.
+
+If you set up a rig **without** these flags and your fork's `main` has
+already been polluted, see
+[docs/guides/fork-rig-setup.md](docs/guides/fork-rig-setup.md) for
+verification and recovery steps.
+
 ## Development Workflow
 
 We use a direct-to-main workflow for trusted contributors. For external contributors:
@@ -125,6 +167,45 @@ For specific packages:
 go test ./internal/wisp/...
 go test ./cmd/gt/...
 ```
+
+### Integration Test Guards
+
+Integration tests (tagged `//go:build integration`) require external resources
+that may not be available in every environment. Use the helpers in
+`internal/testutil` to skip gracefully when prerequisites are missing:
+
+| Helper | When to use |
+|--------|-------------|
+| `testutil.RequireDoltContainer(t)` | Test needs a running Dolt SQL server (starts a Docker container) |
+| `testutil.StartIsolatedDoltContainer(t)` | Test needs its own isolated Dolt instance (per-test container) |
+| `testutil.RequireTownEnv(t)` | Test needs a live Gas Town workspace (checks `workspace.FindFromCwd` + `rigs.json`); returns root path |
+
+**`requireDoltServer`** (in `internal/cmd`) is a local wrapper around
+`testutil.RequireDoltContainer` used by the `cmd` package's integration tests.
+
+**When to use which guard:**
+
+- Tests that connect to Dolt (create databases, run SQL) →
+  `RequireDoltContainer` or `StartIsolatedDoltContainer`
+- Tests that need a real Gas Town directory tree (shell out to `gt`/`bd` with
+  workspace detection) → `RequireTownEnv`
+- Tests that create their own temporary town via `t.TempDir()` → no guard needed
+  (they are self-contained)
+
+For packages with many Dolt-dependent tests, prefer adding
+`testutil.EnsureDoltContainerForTestMain()` in a `TestMain` function so all
+tests in the package share a single container.
+
+## Releasing
+
+Releases are cut from tags of the form `vX.Y.Z`. See [RELEASING.md](RELEASING.md)
+for the full workflow. One guardrail to know about:
+
+- `make check-version-tag` verifies the `Version` constant in
+  `internal/cmd/version.go` matches the tag at HEAD. The release workflow runs
+  this before GoReleaser and fails the release on mismatch. Prevents recurrence
+  of [#3459](https://github.com/steveyegge/gastown/issues/3459). Run it locally
+  after bumping if you want to catch drift before pushing the tag.
 
 ## Questions?
 

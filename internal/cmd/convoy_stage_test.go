@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 // U-01: Simple 2-node cycle A→B→A
@@ -1872,8 +1874,9 @@ func TestCreateStagedConvoy_CleanReady(t *testing.T) {
 
 	// Verify bd dep add was called for each slingable bead.
 	for _, beadID := range []string{"gt-a", "gt-b", "gt-c"} {
-		if !strings.Contains(logContent, "dep add "+convoyID+" "+beadID) {
-			t.Errorf("bd.log should contain 'dep add %s %s', got:\n%s", convoyID, beadID, logContent)
+		targetID := "external:gt:" + beadID
+		if !strings.Contains(logContent, "dep add "+convoyID+" "+targetID) {
+			t.Errorf("bd.log should contain 'dep add %s %s', got:\n%s", convoyID, targetID, logContent)
 		}
 	}
 }
@@ -1920,8 +1923,9 @@ func TestCreateStagedConvoy_TracksOnlySlingable(t *testing.T) {
 
 	// Slingable beads (tasks and bugs) should be tracked.
 	for _, beadID := range []string{"gt-t1", "gt-b1", "gt-t2"} {
-		if !strings.Contains(logContent, "dep add "+convoyID+" "+beadID) {
-			t.Errorf("bd.log should contain 'dep add %s %s' for slingable bead, got:\n%s", convoyID, beadID, logContent)
+		targetID := "external:gt:" + beadID
+		if !strings.Contains(logContent, "dep add "+convoyID+" "+targetID) {
+			t.Errorf("bd.log should contain 'dep add %s %s' for slingable bead, got:\n%s", convoyID, targetID, logContent)
 		}
 	}
 
@@ -1975,7 +1979,7 @@ func TestCreateStagedConvoy_DescriptionFormat(t *testing.T) {
 	lines := strings.Split(logContent, "\n")
 	var createLine string
 	for _, line := range lines {
-		if strings.Contains(line, "create") && strings.Contains(line, "--type=convoy") {
+		if strings.Contains(line, "create") && strings.Contains(line, "--type=task") && strings.Contains(line, "--labels=gt:convoy") {
 			createLine = line
 			break
 		}
@@ -2148,9 +2152,9 @@ func TestRestageConvoy_DetectionLogic(t *testing.T) {
 		t.Fatalf("bdShow: %v", err)
 	}
 
-	// Verify it's a convoy.
-	if result.IssueType != "convoy" {
-		t.Fatalf("expected convoy type, got %q", result.IssueType)
+	// Verify it's recognized as a convoy.
+	if !isConvoyIssue(result.IssueType, result.Labels) {
+		t.Fatalf("expected convoy bead, got type %q labels %v", result.IssueType, result.Labels)
 	}
 
 	// Verify status is "staged_ready".
@@ -2414,6 +2418,108 @@ func TestJSONFlag_RegisteredOnCommand(t *testing.T) {
 	if flag.DefValue != "false" {
 		t.Errorf("--json default should be false, got %q", flag.DefValue)
 	}
+}
+
+func TestJSONOutput_NoArgsReturnsEnvelope(t *testing.T) {
+	cmd := newJSONStageTestCommand(t)
+	output, stderrOutput, err := runStageCommandJSONTest(t, cmd, "--json")
+	if err == nil {
+		t.Fatal("expected error for missing stage args, got nil")
+	}
+	if stderrOutput != "" {
+		t.Fatalf("stderr should be empty in JSON mode, got:\n%s", stderrOutput)
+	}
+
+	var parsed StageResult
+	if err := json.Unmarshal([]byte(output), &parsed); err != nil {
+		t.Fatalf("missing-args output should be valid JSON: %v\nraw:\n%s", err, output)
+	}
+	if parsed.Status != "error" {
+		t.Errorf("status should be 'error', got %q", parsed.Status)
+	}
+	if len(parsed.Errors) != 1 {
+		t.Fatalf("expected one JSON error, got %d", len(parsed.Errors))
+	}
+	if parsed.Errors[0].Category != "validation" {
+		t.Errorf("error category = %q, want validation", parsed.Errors[0].Category)
+	}
+	if parsed.Errors[0].BeadIDs == nil {
+		t.Error("error bead_ids should be an empty array, not null")
+	}
+	if parsed.Waves == nil || parsed.Tree == nil || parsed.Warnings == nil {
+		t.Fatalf("JSON arrays should be empty arrays, not null: %#v", parsed)
+	}
+}
+
+func TestJSONOutput_FlagParseErrorReturnsEnvelope(t *testing.T) {
+	for _, args := range [][]string{{"--json", "--unknown"}, {"--unknown", "--json"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			cmd := newJSONStageTestCommand(t)
+			oldArgs := os.Args
+			os.Args = append([]string{"gt", "convoy", "stage"}, args...)
+			t.Cleanup(func() { os.Args = oldArgs })
+
+			output, stderrOutput, err := runStageCommandJSONTest(t, cmd, args...)
+			if err == nil {
+				t.Fatal("expected error for unknown flag, got nil")
+			}
+			if stderrOutput != "" {
+				t.Fatalf("stderr should be empty in JSON mode, got:\n%s", stderrOutput)
+			}
+
+			var parsed StageResult
+			if err := json.Unmarshal([]byte(output), &parsed); err != nil {
+				t.Fatalf("flag parse error output should be valid JSON: %v\nraw:\n%s", err, output)
+			}
+			if parsed.Status != "error" {
+				t.Errorf("status should be 'error', got %q", parsed.Status)
+			}
+			if len(parsed.Errors) != 1 {
+				t.Fatalf("expected one JSON error, got %d", len(parsed.Errors))
+			}
+			if parsed.Errors[0].Category != "validation" {
+				t.Errorf("error category = %q, want validation", parsed.Errors[0].Category)
+			}
+			if parsed.Errors[0].BeadIDs == nil || parsed.Waves == nil || parsed.Tree == nil || parsed.Warnings == nil {
+				t.Fatalf("JSON arrays should be empty arrays, not null: %#v", parsed)
+			}
+		})
+	}
+}
+
+func newJSONStageTestCommand(t *testing.T) *cobra.Command {
+	t.Helper()
+	oldJSON := convoyStageJSON
+	convoyStageJSON = false
+	t.Cleanup(func() { convoyStageJSON = oldJSON })
+
+	cmd := &cobra.Command{Use: "stage", RunE: runConvoyStage}
+	cmd.Flags().BoolVar(&convoyStageJSON, "json", false, "Output machine-readable JSON")
+	cmd.SetFlagErrorFunc(convoyStageFlagError)
+	return cmd
+}
+
+func runStageCommandJSONTest(t *testing.T, cmd *cobra.Command, args ...string) (string, string, error) {
+	t.Helper()
+	oldStdout := os.Stdout
+	stdoutR, stdoutW, _ := os.Pipe()
+	os.Stdout = stdoutW
+
+	oldStderr := os.Stderr
+	stderrR, stderrW, _ := os.Pipe()
+	os.Stderr = stderrW
+
+	cmd.SetArgs(args)
+	err := cmd.Execute()
+
+	stdoutW.Close()
+	stderrW.Close()
+	os.Stdout = oldStdout
+	os.Stderr = oldStderr
+
+	outBytes, _ := io.ReadAll(stdoutR)
+	stderrBytes, _ := io.ReadAll(stderrR)
+	return string(outBytes), string(stderrBytes), err
 }
 
 // IT-22: --json output: no human-readable text on stdout.
@@ -2760,5 +2866,140 @@ func TestBuildWavesJSON_TaskDetails(t *testing.T) {
 	}
 	if len(wj[1].Tasks[0].BlockedBy) != 1 || wj[1].Tasks[0].BlockedBy[0] != "a" {
 		t.Errorf("task b blocked_by = %v", wj[1].Tasks[0].BlockedBy)
+	}
+}
+
+// TestAppendValidationWave_CreatesCapstoneWave verifies that appendValidationWave
+// creates a validation bead blocked by all slingable tasks and appends it as the
+// final wave.
+func TestAppendValidationWave_CreatesCapstoneWave(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows — shell stubs")
+	}
+
+	testDAG := newTestDAG(t).
+		Epic("epic-1", "Test Epic").
+		Task("gt-a", "Task A", withRig("gastown")).ParentOf("epic-1").
+		Task("gt-b", "Task B", withRig("gastown")).ParentOf("epic-1").BlockedBy("gt-a")
+
+	_, logPath := testDAG.Setup(t)
+
+	// Build the ConvoyDAG.
+	dag := &ConvoyDAG{Nodes: map[string]*ConvoyDAGNode{
+		"epic-1": {ID: "epic-1", Title: "Test Epic", Type: "epic", Status: "open"},
+		"gt-a":   {ID: "gt-a", Title: "Task A", Type: "task", Status: "open", Rig: "gastown", Blocks: []string{"gt-b"}},
+		"gt-b":   {ID: "gt-b", Title: "Task B", Type: "task", Status: "open", Rig: "gastown", BlockedBy: []string{"gt-a"}},
+	}}
+
+	// Compute waves first.
+	waves, _, err := computeWaves(dag)
+	if err != nil {
+		t.Fatalf("computeWaves: %v", err)
+	}
+	if len(waves) != 2 {
+		t.Fatalf("expected 2 waves before validation, got %d", len(waves))
+	}
+
+	// Append validation wave.
+	waves, validationID, err := appendValidationWave(dag, waves, "epic-1")
+	if err != nil {
+		t.Fatalf("appendValidationWave: %v", err)
+	}
+
+	// Verify validation bead was created.
+	if validationID == "" {
+		t.Fatal("expected non-empty validation bead ID")
+	}
+	if !strings.HasPrefix(validationID, "hq-") {
+		t.Errorf("validation bead ID should start with hq-, got %q", validationID)
+	}
+
+	// Verify waves: should now have 3 waves (original 2 + validation).
+	if len(waves) != 3 {
+		t.Fatalf("expected 3 waves after validation, got %d", len(waves))
+	}
+	if waves[2].Number != 3 {
+		t.Errorf("validation wave number = %d, want 3", waves[2].Number)
+	}
+	if len(waves[2].Tasks) != 1 || waves[2].Tasks[0] != validationID {
+		t.Errorf("validation wave tasks = %v, want [%s]", waves[2].Tasks, validationID)
+	}
+
+	// Verify the validation bead was added to the DAG.
+	valNode, ok := dag.Nodes[validationID]
+	if !ok {
+		t.Fatal("validation bead not found in DAG")
+	}
+	if valNode.Type != "task" {
+		t.Errorf("validation bead type = %q, want task", valNode.Type)
+	}
+	if valNode.Parent != "epic-1" {
+		t.Errorf("validation bead parent = %q, want epic-1", valNode.Parent)
+	}
+
+	// Verify it's blocked by all slingable beads.
+	blockedBy := make(map[string]bool)
+	for _, id := range valNode.BlockedBy {
+		blockedBy[id] = true
+	}
+	if !blockedBy["gt-a"] || !blockedBy["gt-b"] {
+		t.Errorf("validation bead should be blocked by gt-a and gt-b, got %v", valNode.BlockedBy)
+	}
+
+	// Verify slingable nodes now block the validation bead.
+	if nodeA, ok := dag.Nodes["gt-a"]; ok {
+		found := false
+		for _, id := range nodeA.Blocks {
+			if id == validationID {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("gt-a should block validation bead, Blocks = %v", nodeA.Blocks)
+		}
+	}
+
+	// Verify bd commands were logged: create, dep add parent-child, dep add blocks.
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd.log: %v", err)
+	}
+	logContent := string(logBytes)
+
+	if !strings.Contains(logContent, "create") {
+		t.Errorf("bd.log should contain 'create' command")
+	}
+	if !strings.Contains(logContent, "--type=task") {
+		t.Errorf("bd.log should contain '--type=task'")
+	}
+	if !strings.Contains(logContent, "mol-validate-prd") {
+		t.Errorf("bd.log should contain 'mol-validate-prd' in description")
+	}
+	if !strings.Contains(logContent, "dep add epic-1 "+validationID+" --type=parent-child") {
+		t.Errorf("bd.log should contain parent-child dep add, got:\n%s", logContent)
+	}
+	for _, beadID := range []string{"gt-a", "gt-b"} {
+		if !strings.Contains(logContent, "dep add "+beadID+" "+validationID+" --type=blocks") {
+			t.Errorf("bd.log should contain 'dep add %s %s --type=blocks', got:\n%s", beadID, validationID, logContent)
+		}
+	}
+}
+
+// TestAppendValidationWave_NoSlingableBeads verifies that appendValidationWave
+// returns early when there are no slingable beads (e.g., epic-only DAG).
+func TestAppendValidationWave_NoSlingableBeads(t *testing.T) {
+	dag := &ConvoyDAG{Nodes: map[string]*ConvoyDAGNode{
+		"epic-1": {ID: "epic-1", Title: "Test Epic", Type: "epic", Status: "open"},
+	}}
+
+	waves, validationID, err := appendValidationWave(dag, nil, "epic-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if validationID != "" {
+		t.Errorf("expected empty validation ID for no slingable beads, got %q", validationID)
+	}
+	if len(waves) != 0 {
+		t.Errorf("expected 0 waves, got %d", len(waves))
 	}
 }

@@ -6,8 +6,11 @@ import (
 	"strings"
 	"time"
 
+	agentconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/reaper"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 const (
@@ -17,11 +20,12 @@ const (
 	// Wisps older than this are reaped (closed). Configurable via formula var max_age.
 	defaultWispMaxAge = 24 * time.Hour
 	// Closed wisps older than this are permanently deleted. Formula var: purge_age.
-	defaultWispDeleteAge = 3 * 24 * time.Hour
+	defaultWispDeleteAge = 7 * 24 * time.Hour
 	// Alert threshold: if open wisp count exceeds this, the Dog should escalate.
-	wispAlertThreshold = 500
+	// Shared with `gt reaper run` warning. See reaper.DefaultAlertThreshold.
+	wispAlertThreshold = reaper.DefaultAlertThreshold
 	// Closed mail older than this is permanently deleted. Formula var: mail_delete_age.
-	defaultMailDeleteAge = 3 * 24 * time.Hour
+	defaultMailDeleteAge = 7 * 24 * time.Hour
 	// Issues stale longer than this are auto-closed. Formula var: stale_issue_age.
 	defaultStaleIssueAge = 7 * 24 * time.Hour
 )
@@ -77,7 +81,7 @@ func wispDeleteAge(config *DaemonPatrolConfig) time.Duration {
 // The Dog reads the formula steps and calls `gt reaper` CLI helpers.
 // Falls back to inline execution if Dog dispatch fails.
 func (d *Daemon) reapWisps() {
-	if !IsPatrolEnabled(d.patrolConfig, "wisp_reaper") {
+	if !d.isPatrolActive("wisp_reaper") {
 		return
 	}
 
@@ -91,7 +95,6 @@ func (d *Daemon) reapWisps() {
 		"stale_issue_age": defaultStaleIssueAge.String(),
 		"mail_delete_age": defaultMailDeleteAge.String(),
 		"alert_threshold": fmt.Sprintf("%d", wispAlertThreshold),
-		"dolt_port":       fmt.Sprintf("%d", d.doltServerPort()),
 	}
 
 	if config.DryRun {
@@ -126,8 +129,12 @@ func (d *Daemon) dispatchReaperDog(vars map[string]string) error {
 		args = append(args, "--var", fmt.Sprintf("%s=%s", k, v))
 	}
 
-	cmd := exec.Command("gt", args...)
+	cmd := exec.Command(d.gtPath, args...) //nolint:gosec // G204: d.gtPath resolved at daemon init via LookPath
 	cmd.Dir = d.config.TownRoot
+	// gt sling performs writes, so use mutation routing env: it preserves PATH
+	// while stripping stale bd target selectors and derived Beads endpoint aliases.
+	cmd.Env = bdMutationRoutingEnv(d.config.TownRoot)
+	util.SetDetachedProcessGroup(cmd)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("gt sling: %w", err)
 	}
@@ -138,8 +145,9 @@ func (d *Daemon) dispatchReaperDog(vars map[string]string) error {
 // Dog dispatch is unavailable. Delegates to the reaper package for SQL execution.
 func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge time.Duration, mol *dogMol) {
 	databases := config.Databases
+	host := d.doltServerHost()
 	if len(databases) == 0 {
-		databases = reaper.DiscoverDatabases("127.0.0.1", d.doltServerPort())
+		databases = reaper.DiscoverDatabases(host, d.doltServerPort())
 	}
 	if len(databases) == 0 {
 		d.logger.Printf("wisp_reaper: no databases to reap")
@@ -151,7 +159,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 
 	port := d.doltServerPort()
 	dryRun := config.DryRun
-	var totalReaped, totalOpen, totalPurged, totalMailPurged, totalAutoClosed int
+	var totalReaped, totalMoleculeSteps, totalOpen, totalPurged, totalMailPurged, totalAutoClosed int
 
 	// Step 2: Reap
 	reapErrors := 0
@@ -159,7 +167,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		if err := reaper.ValidateDBName(dbName); err != nil {
 			continue
 		}
-		db, err := reaper.OpenDB("127.0.0.1", port, dbName, 10*time.Second, 10*time.Second)
+		db, err := reaper.OpenDB(host, port, dbName, 10*time.Second, 10*time.Second)
 		if err != nil {
 			d.logger.Printf("wisp_reaper: %s: connect error: %v", dbName, err)
 			reapErrors++
@@ -178,9 +186,14 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 			continue
 		}
 		totalReaped += result.Reaped
+		totalMoleculeSteps += result.MoleculeStepsClosed
 		totalOpen += result.OpenRemain
-		if result.Reaped > 0 {
-			d.logger.Printf("wisp_reaper: %s: reaped %d stale wisps, %d open remain", dbName, result.Reaped, result.OpenRemain)
+		if result.Reaped > 0 || result.MoleculeStepsClosed > 0 {
+			reapSummary := fmt.Sprintf("wisp_reaper: %s: reaped %d stale wisps", dbName, result.Reaped)
+			if result.MoleculeStepsClosed > 0 {
+				reapSummary += fmt.Sprintf(", closed %d molecule steps", result.MoleculeStepsClosed)
+			}
+			d.logger.Printf("%s, %d open remain", reapSummary, result.OpenRemain)
 		}
 	}
 	if reapErrors > 0 {
@@ -195,7 +208,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		if err := reaper.ValidateDBName(dbName); err != nil {
 			continue
 		}
-		db, err := reaper.OpenDB("127.0.0.1", port, dbName, 30*time.Second, 30*time.Second)
+		db, err := reaper.OpenDB(host, port, dbName, 30*time.Second, 30*time.Second)
 		if err != nil {
 			purgeErrors++
 			continue
@@ -223,13 +236,67 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		mol.closeStep("purge")
 	}
 
+	// Step 3b: Close plugin receipts (fast-track — 1h instead of 7d stale age)
+	pluginReceiptAge := 1 * time.Hour
+	var totalPluginClosed int
+	for _, dbName := range databases {
+		if err := reaper.ValidateDBName(dbName); err != nil {
+			continue
+		}
+		db, err := reaper.OpenDB(host, port, dbName, 10*time.Second, 10*time.Second)
+		if err != nil {
+			continue
+		}
+		if ok, _ := reaper.HasReaperSchema(db); !ok {
+			db.Close()
+			continue
+		}
+		result, err := reaper.ClosePluginReceipts(db, dbName, pluginReceiptAge, dryRun)
+		db.Close()
+		if err != nil {
+			d.logger.Printf("wisp_reaper: %s: plugin receipt close error: %v", dbName, err)
+			continue
+		}
+		totalPluginClosed += result.Closed
+		if result.Closed > 0 {
+			d.logger.Printf("wisp_reaper: %s: closed %d plugin receipts", dbName, result.Closed)
+		}
+	}
+
+	// Step 3c: Close plugin dispatch mails (daemon→dog instruction beads that are never closed)
+	pluginDispatchAge := 1 * time.Hour
+	var totalDispatchClosed int
+	for _, dbName := range databases {
+		if err := reaper.ValidateDBName(dbName); err != nil {
+			continue
+		}
+		db, err := reaper.OpenDB(host, port, dbName, 10*time.Second, 10*time.Second)
+		if err != nil {
+			continue
+		}
+		if ok, _ := reaper.HasReaperSchema(db); !ok {
+			db.Close()
+			continue
+		}
+		result, err := reaper.ClosePluginDispatches(db, dbName, pluginDispatchAge, dryRun)
+		db.Close()
+		if err != nil {
+			d.logger.Printf("wisp_reaper: %s: plugin dispatch close error: %v", dbName, err)
+			continue
+		}
+		totalDispatchClosed += result.Closed
+		if result.Closed > 0 {
+			d.logger.Printf("wisp_reaper: %s: closed %d plugin dispatches", dbName, result.Closed)
+		}
+	}
+
 	// Step 4: Auto-close
 	autoCloseErrors := 0
 	for _, dbName := range databases {
 		if err := reaper.ValidateDBName(dbName); err != nil {
 			continue
 		}
-		db, err := reaper.OpenDB("127.0.0.1", port, dbName, 10*time.Second, 10*time.Second)
+		db, err := reaper.OpenDB(host, port, dbName, 10*time.Second, 10*time.Second)
 		if err != nil {
 			autoCloseErrors++
 			continue
@@ -260,8 +327,13 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		d.logger.Printf("wisp_reaper: WARNING: %d open wisps exceed threshold %d — investigate wisp lifecycle",
 			totalOpen, wispAlertThreshold)
 	}
-	d.logger.Printf("wisp_reaper: cycle complete — reaped=%d purged=%d mail_purged=%d auto_closed=%d open=%d databases=%d dryRun=%v",
-		totalReaped, totalPurged, totalMailPurged, totalAutoClosed, totalOpen, len(databases), dryRun)
+	summary := fmt.Sprintf("wisp_reaper: cycle complete — reaped=%d", totalReaped)
+	if totalMoleculeSteps > 0 {
+		summary += fmt.Sprintf(" molecule_steps_closed=%d", totalMoleculeSteps)
+	}
+	summary += fmt.Sprintf(" purged=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
+		totalPurged, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
+	d.logger.Printf("%s", summary)
 	mol.closeStep("report")
 }
 
@@ -270,5 +342,21 @@ func (d *Daemon) doltServerPort() int {
 	if d.doltServer != nil {
 		return d.doltServer.config.Port
 	}
-	return 3307
+	if port := agentconfig.ResolveDoltPort(d.config.TownRoot); port > 0 {
+		return port
+	}
+	return doltserver.DefaultPort
+}
+
+func (d *Daemon) doltServerHost() string {
+	if d.doltServer != nil && d.doltServer.config.Host != "" {
+		return d.doltServer.config.Host
+	}
+	if host := agentconfig.ResolveDoltHost(d.config.TownRoot); host != "" {
+		return host
+	}
+	if cfg := doltserver.DefaultConfig(d.config.TownRoot); cfg.Host != "" {
+		return cfg.Host
+	}
+	return "127.0.0.1"
 }

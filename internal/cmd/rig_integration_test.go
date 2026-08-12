@@ -59,7 +59,9 @@ var agentAllowlist = map[string][]string{
 
 	// Polecats are ephemeral worktrees for autonomous agents.
 	"polecat": {
+		"?? .claude/",   // bd init: creates .claude/commands/ with handoff/review slash commands
 		"?? .gitignore", // EnsureGitignorePatterns: adds .claude/, .runtime/, .logs/, __pycache__/ patterns
+		"?? CLAUDE.md",  // CreatePolecatCLAUDEmd: gt done instructions and lifecycle context
 	},
 }
 
@@ -498,6 +500,59 @@ func TestRigAddCreatesCorrectStructure(t *testing.T) {
 	}
 }
 
+// TestRigAddRespectsDefaultAgent verifies that gt rig add scaffolds the polecat
+// config directory matching the town's default_agent setting (gt-vdx).
+func TestRigAddRespectsDefaultAgent(t *testing.T) {
+	requireDoltServer(t)
+	_ = mockBdCommand(t)
+	townRoot := setupTestTown(t)
+	bridgeDoltPidToTown(t, townRoot)
+	gitURL := createTestGitRepo(t, "agenttest")
+
+	// Write a town settings file with default_agent=opencode.
+	settingsDir := filepath.Join(townRoot, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatalf("mkdir settings: %v", err)
+	}
+	townSettings := config.NewTownSettings()
+	townSettings.DefaultAgent = "opencode"
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("save town settings: %v", err)
+	}
+
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	rigsConfig, err := config.LoadRigsConfig(rigsPath)
+	if err != nil {
+		t.Fatalf("load rigs.json: %v", err)
+	}
+
+	g := git.NewGit(townRoot)
+	mgr := rig.NewManager(townRoot, rigsConfig, g)
+
+	_, err = mgr.AddRig(rig.AddRigOptions{
+		Name:        "agentrig",
+		GitURL:      gitURL,
+		BeadsPrefix: "ar",
+	})
+	if err != nil {
+		t.Fatalf("AddRig: %v", err)
+	}
+
+	rigPath := filepath.Join(townRoot, "agentrig")
+
+	// With default_agent=opencode, polecats/ should use .opencode/, not .claude/.
+	opencodePath := filepath.Join(rigPath, "polecats", ".opencode")
+	if _, err := os.Stat(opencodePath); os.IsNotExist(err) {
+		t.Errorf("polecats/.opencode/ should exist when default_agent=opencode")
+	}
+
+	// .claude/ must NOT be created when default_agent=opencode.
+	claudePath := filepath.Join(rigPath, "polecats", ".claude")
+	if _, err := os.Stat(claudePath); err == nil {
+		t.Errorf("polecats/.claude/ should NOT exist when default_agent=opencode")
+	}
+}
+
 // TestRigAddInitializesBeads verifies that beads is initialized with
 // the correct prefix.
 func TestRigAddInitializesBeads(t *testing.T) {
@@ -665,10 +720,7 @@ func TestRigAddUpdatesRigsJson(t *testing.T) {
 		t.Fatalf("AddRig: %v", err)
 	}
 
-	// Save rigs config (normally done by the command)
-	if err := config.SaveRigsConfig(rigsPath, rigsConfig); err != nil {
-		t.Fatalf("save rigs.json: %v", err)
-	}
+	// AddRig saves rigs.json atomically — no separate save needed.
 
 	// Reload and verify
 	rigsConfig2, err := config.LoadRigsConfig(rigsPath)
@@ -959,7 +1011,6 @@ func TestRigAddRejectsInvalidNames(t *testing.T) {
 // witness and refinery agent beads via the manager's initAgentBeads.
 func TestRigAddCreatesAgentBeads(t *testing.T) {
 	requireDoltServer(t)
-	bdLogPath := mockBdCommand(t)
 	townRoot := setupTestTown(t)
 	bridgeDoltPidToTown(t, townRoot)
 	gitURL := createTestGitRepo(t, "agentbeadtest")
@@ -983,13 +1034,6 @@ func TestRigAddCreatesAgentBeads(t *testing.T) {
 		t.Fatalf("AddRig: %v", err)
 	}
 
-	// Verify the mock bd was called with correct create commands
-	logContent, err := os.ReadFile(bdLogPath)
-	if err != nil {
-		t.Fatalf("reading bd log: %v", err)
-	}
-	logStr := string(logContent)
-
 	// Expected bead IDs that initAgentBeads should create
 	witnessID := beads.WitnessBeadIDWithPrefix(newRig.Config.Prefix, "agentbeadtest")
 	refineryID := beads.RefineryBeadIDWithPrefix(newRig.Config.Prefix, "agentbeadtest")
@@ -1002,15 +1046,11 @@ func TestRigAddCreatesAgentBeads(t *testing.T) {
 		{refineryID, "refinery agent bead"},
 	}
 
+	rigBeads := beads.NewWithBeadsDir(newRig.Path, beads.ResolveBeadsDir(newRig.Path))
 	for _, expected := range expectedIDs {
-		if !strings.Contains(logStr, expected.id) {
-			t.Errorf("bd create log should contain %s (%s), got:\n%s", expected.id, expected.desc, logStr)
+		if _, err := rigBeads.Show(expected.id); err != nil {
+			t.Errorf("expected %s (%s) to exist: %v", expected.id, expected.desc, err)
 		}
-	}
-
-	// Verify correct prefix is used (ab-)
-	if !strings.Contains(logStr, "ab-") {
-		t.Errorf("bd create log should contain prefix 'ab-', got:\n%s", logStr)
 	}
 }
 
@@ -1063,7 +1103,7 @@ func TestAgentBeadIDs(t *testing.T) {
 // Known issues this test catches:
 // - Extra files in .beads/ beyond redirect (e.g., PRIME.md, databases)
 // - AGENTS.md being copied/created in worktrees
-// - CLAUDE.md being created in worktrees
+// - CLAUDE.md being created in non-polecat worktrees (polecats need it for gt done)
 // - Any other Gas Town artifacts polluting the repo
 //
 // Tests two scenarios:

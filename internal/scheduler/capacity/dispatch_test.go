@@ -141,6 +141,59 @@ func TestDispatchCycle_Run_WithFailures(t *testing.T) {
 	}
 }
 
+func TestDispatchCycle_RunPlan_DoesNotRequery(t *testing.T) {
+	queried := false
+	checkedCapacity := false
+	dispatched := []string{}
+	successCalled := []string{}
+
+	cycle := &DispatchCycle{
+		AvailableCapacity: func() (int, error) {
+			checkedCapacity = true
+			return 0, nil
+		},
+		QueryPending: func() ([]PendingBead, error) {
+			queried = true
+			return nil, nil
+		},
+		Validate: func(b PendingBead) error {
+			if b.ID == "blocked" {
+				return errors.New("blocked")
+			}
+			return nil
+		},
+		Execute: func(b PendingBead) error {
+			dispatched = append(dispatched, b.ID)
+			return nil
+		},
+		OnSuccess: func(b PendingBead) error {
+			successCalled = append(successCalled, b.ID)
+			return nil
+		},
+		BatchSize: 10,
+	}
+
+	report, err := cycle.RunPlan(DispatchPlan{
+		ToDispatch: []PendingBead{{ID: "planned"}, {ID: "blocked"}},
+		Reason:     "ready",
+	})
+	if err != nil {
+		t.Fatalf("RunPlan() error: %v", err)
+	}
+	if queried || checkedCapacity {
+		t.Fatalf("RunPlan re-queried: queried=%v checkedCapacity=%v", queried, checkedCapacity)
+	}
+	if report.Dispatched != 1 || report.Failed != 1 || report.Reason != "ready" {
+		t.Fatalf("report = %+v, want dispatched=1 failed=1 reason=ready", report)
+	}
+	if len(dispatched) != 1 || dispatched[0] != "planned" {
+		t.Fatalf("dispatched = %v, want [planned]", dispatched)
+	}
+	if len(successCalled) != 1 || successCalled[0] != "planned" {
+		t.Fatalf("successCalled = %v, want [planned]", successCalled)
+	}
+}
+
 func TestDispatchCycle_Run_NoBeads(t *testing.T) {
 	cycle := &DispatchCycle{
 		AvailableCapacity: func() (int, error) { return 5, nil },
@@ -158,6 +211,33 @@ func TestDispatchCycle_Run_NoBeads(t *testing.T) {
 	}
 	if report.Reason != "none" {
 		t.Errorf("Reason = %q, want %q", report.Reason, "none")
+	}
+}
+
+func TestDispatchCycle_Run_ZeroCapacity(t *testing.T) {
+	beads := []PendingBead{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	cycle := &DispatchCycle{
+		AvailableCapacity: func() (int, error) { return 0, nil },
+		QueryPending:      func() ([]PendingBead, error) { return beads, nil },
+		Execute:           func(b PendingBead) error { t.Error("Execute should not be called at zero capacity"); return nil },
+		BatchSize:         10,
+	}
+
+	report, err := cycle.Run()
+	if err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+	if report.Dispatched != 0 {
+		t.Errorf("Dispatched = %d, want 0", report.Dispatched)
+	}
+	if report.Failed != 0 {
+		t.Errorf("Failed = %d, want 0", report.Failed)
+	}
+	if report.Skipped != 3 {
+		t.Errorf("Skipped = %d, want 3", report.Skipped)
+	}
+	if report.Reason != "capacity" {
+		t.Errorf("Reason = %q, want %q", report.Reason, "capacity")
 	}
 }
 
@@ -249,6 +329,93 @@ func TestDispatchCycle_Run_OnSuccessRetry(t *testing.T) {
 	}
 	if attempts["a"] != 2 {
 		t.Errorf("OnSuccess attempts = %d, want 2 (1 fail + 1 success)", attempts["a"])
+	}
+}
+
+func TestBeadIDPrefix(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"gt-abc", "gt"},
+		{"hq-uejt", "hq"},
+		{"wisp-xyz-123", "wisp"},
+		{"noprefix", ""},
+		{"", ""},
+		{"-leading", ""},
+	}
+	for _, tt := range tests {
+		if got := BeadIDPrefix(tt.in); got != tt.want {
+			t.Errorf("BeadIDPrefix(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestAcceptsPrefix(t *testing.T) {
+	tests := []struct {
+		name, rigPrefix, beadID string
+		want                    bool
+	}{
+		{"matching", "gt", "gt-abc", true},
+		{"mismatched", "gt", "hq-uejt", false},
+		{"empty rig prefix accepts all", "", "hq-uejt", true},
+		{"bead with no prefix vs gt rig", "gt", "barewordbead", false},
+		{"matching wisp", "wisp", "wisp-di92", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := AcceptsPrefix(tt.rigPrefix, tt.beadID); got != tt.want {
+				t.Errorf("AcceptsPrefix(%q, %q) = %v, want %v",
+					tt.rigPrefix, tt.beadID, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDispatchCycle_Run_ValidateRefusesCrossRigPrefix(t *testing.T) {
+	// Validate returns ErrCrossRigPrefix for `hq-` beads on a `gt`-prefix rig;
+	// Execute must not be called for the refused bead.
+	rigPrefix := "gt"
+	executed := []string{}
+	failureErrs := map[string]error{}
+
+	cycle := &DispatchCycle{
+		AvailableCapacity: func() (int, error) { return 100, nil },
+		QueryPending: func() ([]PendingBead, error) {
+			return []PendingBead{
+				{ID: "ctx-a", WorkBeadID: "gt-abc", TargetRig: "walletui"},
+				{ID: "ctx-b", WorkBeadID: "hq-uejt", TargetRig: "walletui"},
+			}, nil
+		},
+		Validate: func(b PendingBead) error {
+			if !AcceptsPrefix(rigPrefix, b.WorkBeadID) {
+				return ErrCrossRigPrefix
+			}
+			return nil
+		},
+		Execute: func(b PendingBead) error {
+			executed = append(executed, b.WorkBeadID)
+			return nil
+		},
+		OnSuccess: func(b PendingBead) error { return nil },
+		OnFailure: func(b PendingBead, err error) { failureErrs[b.WorkBeadID] = err },
+		BatchSize: 10,
+	}
+
+	report, err := cycle.Run()
+	if err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+	if report.Dispatched != 1 {
+		t.Errorf("Dispatched = %d, want 1", report.Dispatched)
+	}
+	if report.Failed != 1 {
+		t.Errorf("Failed = %d, want 1", report.Failed)
+	}
+	if len(executed) != 1 || executed[0] != "gt-abc" {
+		t.Errorf("Execute should run only for gt-abc, got %v", executed)
+	}
+	if !errors.Is(failureErrs["hq-uejt"], ErrCrossRigPrefix) {
+		t.Errorf("OnFailure for hq-uejt err = %v, want ErrCrossRigPrefix", failureErrs["hq-uejt"])
 	}
 }
 

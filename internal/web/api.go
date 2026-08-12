@@ -10,11 +10,14 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -131,6 +134,8 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleIssueUpdate(w, r)
 	case path == "/pr/show" && r.Method == http.MethodGet:
 		h.handlePRShow(w, r)
+	case path == "/rig/add" && r.Method == http.MethodPost:
+		h.handleRigAdd(w, r)
 	case path == "/crew" && r.Method == http.MethodGet:
 		h.handleCrew(w, r)
 	case path == "/ready" && r.Method == http.MethodGet:
@@ -693,6 +698,16 @@ type OptionsResponse struct {
 // handleOptions returns dynamic options for command arguments.
 // Results are cached for 30 seconds to avoid slow repeated fetches.
 func (h *APIHandler) handleOptions(w http.ResponseWriter, r *http.Request) {
+	optionType := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("type")))
+
+	if optionType == "rigs" {
+		resp := &OptionsResponse{}
+		resp.Rigs = h.loadRigOptions(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+
 	// Check cache first — serialize under RLock to a buffer so we don't
 	// hold the lock while writing to the ResponseWriter (which can block
 	// on slow clients).
@@ -723,13 +738,9 @@ func (h *APIHandler) handleOptions(w http.ResponseWriter, r *http.Request) {
 	// Fetch rigs
 	go func() {
 		defer wg.Done()
-		if output, err := h.runGtCommand(r.Context(), 3*time.Second, []string{"rig", "list"}); err == nil {
-			mu.Lock()
-			resp.Rigs = parseRigListOutput(output)
-			mu.Unlock()
-		} else {
-			log.Printf("warning: handleOptions: rig list: %v", err)
-		}
+		mu.Lock()
+		resp.Rigs = h.loadRigOptions(r.Context())
+		mu.Unlock()
 	}()
 
 	// Fetch polecats
@@ -747,7 +758,7 @@ func (h *APIHandler) handleOptions(w http.ResponseWriter, r *http.Request) {
 	// Fetch convoys
 	go func() {
 		defer wg.Done()
-		if output, err := h.runBdCommand(r.Context(), 3*time.Second, []string{"list", "--type=convoy", "--json"}); err == nil {
+		if output, err := h.runBdCommand(r.Context(), 3*time.Second, []string{"list", "--json", "--limit=0"}); err == nil {
 			mu.Lock()
 			resp.Convoys = parseConvoyListJSON(output)
 			mu.Unlock()
@@ -817,6 +828,75 @@ func (h *APIHandler) handleOptions(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+func (h *APIHandler) loadRigOptions(ctx context.Context) []string {
+	if rigs, err := h.loadRigOptionsFromConfig(); err == nil {
+		return rigs
+	}
+
+	if output, err := h.runGtCommand(ctx, 3*time.Second, []string{"rig", "list", "--json"}); err == nil {
+		return parseRigListJSON(output)
+	} else {
+		log.Printf("warning: handleOptions: rig list --json: %v", err)
+	}
+
+	if output, err := h.runGtCommand(ctx, 3*time.Second, []string{"rig", "list"}); err == nil {
+		return parseRigListOutput(output)
+	} else {
+		log.Printf("warning: handleOptions: rig list fallback: %v", err)
+	}
+
+	return nil
+}
+
+func (h *APIHandler) loadRigOptionsFromConfig() ([]string, error) {
+	rigsPath, err := findRigsConfigPath(h.workDir)
+	if err != nil {
+		return nil, err
+	}
+	rigsConfig, err := config.LoadRigsConfig(rigsPath)
+	if err != nil {
+		return nil, err
+	}
+
+	rigs := make([]string, 0, len(rigsConfig.Rigs))
+	for name := range rigsConfig.Rigs {
+		if strings.TrimSpace(name) != "" {
+			rigs = append(rigs, name)
+		}
+	}
+	sort.Strings(rigs)
+	return rigs, nil
+}
+
+func findRigsConfigPath(startDir string) (string, error) {
+	dir := startDir
+	if dir == "" {
+		var err error
+		dir, err = os.Getwd()
+		if err != nil {
+			return "", err
+		}
+	}
+
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+
+	for {
+		rigsPath := filepath.Join(dir, "mayor", "rigs.json")
+		if _, err := os.Stat(rigsPath); err == nil {
+			return rigsPath, nil
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", os.ErrNotExist
+		}
+		dir = parent
+	}
+}
+
 // parseRigListOutput extracts rig names from the text output of "gt rig list".
 // Example output:
 //
@@ -842,10 +922,30 @@ func parseRigListOutput(output string) []string {
 	return rigs
 }
 
-// parseConvoyListJSON extracts convoy IDs from JSON output of "bd list --type=convoy --json".
+// parseRigListJSON extracts rig names from JSON output of "gt rig list --json".
+func parseRigListJSON(jsonStr string) []string {
+	var rigList []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &rigList); err != nil {
+		return nil
+	}
+
+	rigs := make([]string, 0, len(rigList))
+	for _, rig := range rigList {
+		if rig.Name != "" {
+			rigs = append(rigs, rig.Name)
+		}
+	}
+	return rigs
+}
+
+// parseConvoyListJSON extracts convoy IDs from JSON output of "bd list --json".
 func parseConvoyListJSON(jsonStr string) []string {
 	var convoys []struct {
-		ID string `json:"id"`
+		ID        string   `json:"id"`
+		IssueType string   `json:"issue_type"`
+		Labels    []string `json:"labels"`
 	}
 	if err := json.Unmarshal([]byte(jsonStr), &convoys); err != nil {
 		log.Printf("warning: parseConvoyListJSON: %v", err)
@@ -853,11 +953,20 @@ func parseConvoyListJSON(jsonStr string) []string {
 	}
 	ids := make([]string, 0, len(convoys))
 	for _, c := range convoys {
-		if c.ID != "" {
+		if c.ID != "" && (c.IssueType == "convoy" || webAPIHasLabel(c.Labels, "gt:convoy")) {
 			ids = append(ids, c.ID)
 		}
 	}
 	return ids
+}
+
+func webAPIHasLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if label == target {
+			return true
+		}
+	}
+	return false
 }
 
 // parseHooksListOutput extracts bead names from hooks list output.
@@ -1821,7 +1930,14 @@ func (h *APIHandler) isClaudeRunningInSession(ctx context.Context, sessionName s
 		return false
 	}
 
-	output := strings.ToLower(strings.TrimSpace(stdout.String()))
+	output := strings.TrimSpace(stdout.String())
+	return paneCurrentCommandIsAgent(output)
+}
+
+// paneCurrentCommandIsAgent returns true if tmux #{pane_current_command} names a known
+// Gas Town agent (claude/codex/opencode/cursor-agent/copilot/node, or cursor-agent as "agent").
+func paneCurrentCommandIsAgent(output string) bool {
+	output = strings.ToLower(strings.TrimSpace(output))
 	if output == "" {
 		return false
 	}
@@ -1829,7 +1945,10 @@ func (h *APIHandler) isClaudeRunningInSession(ctx context.Context, sessionName s
 	return strings.Contains(output, "claude") ||
 		strings.Contains(output, "node") ||
 		strings.Contains(output, "codex") ||
-		strings.Contains(output, "opencode")
+		strings.Contains(output, "opencode") ||
+		strings.Contains(output, "cursor-agent") ||
+		strings.Contains(output, "copilot") ||
+		output == "agent"
 }
 
 // hasQuestionInPane checks the last output for question indicators.
@@ -2156,4 +2275,106 @@ func (h *APIHandler) computeDashboardHash(ctx context.Context) string {
 
 	h256 := sha256.Sum256([]byte(strings.Join(parts, "|")))
 	return fmt.Sprintf("%x", h256[:8])
+}
+
+// handleRigAdd creates a new rig, optionally with a local bare repo.
+func (h *APIHandler) handleRigAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name    string `json:"name"`
+		RepoURL string `json:"repo_url,omitempty"`
+		Local   bool   `json:"local,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.sendError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		h.sendError(w, "Rig name is required", http.StatusBadRequest)
+		return
+	}
+	if !isValidRigName(req.Name) {
+		h.sendError(w, "Invalid rig name: must be alphanumeric/underscore only", http.StatusBadRequest)
+		return
+	}
+
+	repoURL := req.RepoURL
+	if req.Local || repoURL == "" {
+		// Create a local bare repo with an initial commit
+		localRepoPath := fmt.Sprintf("/tmp/gastown-repos/%s.git", req.Name)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+
+		// Create bare repo
+		mkdirCmd := exec.CommandContext(ctx, "mkdir", "-p", localRepoPath)
+		if out, err := mkdirCmd.CombinedOutput(); err != nil {
+			h.sendError(w, fmt.Sprintf("Failed to create repo dir: %s %v", string(out), err), http.StatusInternalServerError)
+			return
+		}
+
+		initCmd := exec.CommandContext(ctx, "git", "init", "--bare")
+		initCmd.Dir = localRepoPath
+		if out, err := initCmd.CombinedOutput(); err != nil {
+			h.sendError(w, fmt.Sprintf("Failed to init bare repo: %s %v", string(out), err), http.StatusInternalServerError)
+			return
+		}
+
+		// Clone, create initial commit, push
+		tmpDir := fmt.Sprintf("/tmp/gastown-repos/.tmp-%s", req.Name)
+		cloneCmd := exec.CommandContext(ctx, "git", "clone", localRepoPath, tmpDir)
+		if out, err := cloneCmd.CombinedOutput(); err != nil {
+			h.sendError(w, fmt.Sprintf("Failed to clone: %s %v", string(out), err), http.StatusInternalServerError)
+			return
+		}
+		defer func() {
+			_ = exec.CommandContext(context.Background(), "rm", "-rf", tmpDir).Run()
+		}()
+
+		commitCmd := exec.CommandContext(ctx, "git", "commit", "--allow-empty", "-m", "Initial commit")
+		commitCmd.Dir = tmpDir
+		if out, err := commitCmd.CombinedOutput(); err != nil {
+			h.sendError(w, fmt.Sprintf("Failed to create initial commit: %s %v", string(out), err), http.StatusInternalServerError)
+			return
+		}
+
+		pushCmd := exec.CommandContext(ctx, "git", "push", "origin", "HEAD:main")
+		pushCmd.Dir = tmpDir
+		if out, err := pushCmd.CombinedOutput(); err != nil {
+			h.sendError(w, fmt.Sprintf("Failed to push: %s %v", string(out), err), http.StatusInternalServerError)
+			return
+		}
+
+		repoURL = localRepoPath
+	} else if !isValidGitURL(repoURL) {
+		h.sendError(w, "Invalid git URL", http.StatusBadRequest)
+		return
+	}
+
+	// Run gt rig add
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	output, err := h.runGtCommand(ctx, 55*time.Second, []string{"rig", "add", req.Name, repoURL})
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": false,
+			"error":   err.Error(),
+			"output":  output,
+		})
+		return
+	}
+
+	// Invalidate options cache so rig list updates
+	h.optionsCacheMu.Lock()
+	h.optionsCache = nil
+	h.optionsCacheMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"success": true,
+		"message": fmt.Sprintf("Rig '%s' created successfully", req.Name),
+		"output":  output,
+	})
 }

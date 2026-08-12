@@ -1,6 +1,9 @@
 package rig
 
 import (
+	"cmp"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,17 +11,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/steveyegge/gastown/internal/beads"
-	"github.com/steveyegge/gastown/internal/hooks"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/hooks"
 	"github.com/steveyegge/gastown/internal/templates/commands"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -75,6 +79,15 @@ func convertToSSH(httpsURL string) string {
 			path += ".git"
 		}
 		return "git@gitlab.com:" + path
+	}
+
+	// Handle Bitbucket: https://bitbucket.org/workspace/repo.git -> git@bitbucket.org:workspace/repo.git
+	if strings.HasPrefix(httpsURL, "https://bitbucket.org/") {
+		path := strings.TrimPrefix(httpsURL, "https://bitbucket.org/")
+		if !strings.HasSuffix(path, ".git") {
+			path += ".git"
+		}
+		return "git@bitbucket.org:" + path
 	}
 
 	return ""
@@ -138,6 +151,10 @@ func (m *Manager) DiscoverRigs() ([]*Rig, error) {
 		rigs = append(rigs, rig)
 	}
 
+	slices.SortFunc(rigs, func(a, b *Rig) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
+
 	return rigs, nil
 }
 
@@ -155,6 +172,23 @@ func (m *Manager) GetRig(name string) (*Rig, error) {
 func (m *Manager) RigExists(name string) bool {
 	_, ok := m.config.Rigs[name]
 	return ok
+}
+
+// UsedNamepoolThemes returns the namepool themes currently in use by existing rigs.
+// It checks each rig's settings/config.json for an explicit namepool.style.
+// If no setting is configured, calls the fallbackTheme function to get the default theme.
+func (m *Manager) UsedNamepoolThemes(fallbackTheme func(rigName string) string) []string {
+	var themes []string
+	for name := range m.config.Rigs {
+		rigPath := filepath.Join(m.townRoot, name)
+		settingsPath := filepath.Join(rigPath, "settings", "config.json")
+		if settings, err := config.LoadRigSettings(settingsPath); err == nil && settings.Namepool != nil && settings.Namepool.Style != "" {
+			themes = append(themes, settings.Namepool.Style)
+		} else {
+			themes = append(themes, fallbackTheme(name))
+		}
+	}
+	return themes
 }
 
 // loadRig loads rig details from the filesystem.
@@ -227,16 +261,16 @@ func (m *Manager) loadRig(name string, entry config.RigEntry) (*Rig, error) {
 
 // AddRigOptions configures rig creation.
 type AddRigOptions struct {
-	Name            string   // Rig name (directory name)
-	GitURL          string   // Repository URL (fetch/pull)
-	PushURL         string   // Optional push URL (fork for read-only upstreams)
-	UpstreamURL     string   // Optional upstream URL (for fork workflows)
-	BeadsPrefix     string   // Beads issue prefix (defaults to derived from name)
-	LocalRepo       string   // Optional local repo for reference clones
-	DefaultBranch   string   // Default branch (defaults to auto-detected from remote)
-	SkipDoltCheck   bool     // Skip Dolt server availability check (for tests with mocked beads)
-	CloneFilter     string   // Git clone filter spec (e.g. "blob:none", "tree:0") for partial clones
-	SparseCheckout  []string // Sparse checkout paths (cone mode); empty means no sparse checkout
+	Name           string   // Rig name (directory name)
+	GitURL         string   // Repository URL (fetch/pull)
+	PushURL        string   // Optional push URL (fork for read-only upstreams)
+	UpstreamURL    string   // Optional upstream URL (for fork workflows)
+	BeadsPrefix    string   // Beads issue prefix (defaults to derived from name)
+	LocalRepo      string   // Optional local repo for reference clones
+	DefaultBranch  string   // Default branch (defaults to auto-detected from remote)
+	SkipDoltCheck  bool     // Skip Dolt server availability check (for tests with mocked beads)
+	CloneFilter    string   // Git clone filter spec (e.g. "blob:none", "tree:0") for partial clones
+	SparseCheckout []string // Sparse checkout paths (cone mode); empty means no sparse checkout
 }
 
 func resolveLocalRepo(path, gitURL string) (string, string) {
@@ -329,6 +363,11 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		opts.BeadsPrefix = deriveBeadsPrefix(opts.Name)
 	}
 
+	// Check for prefix collision with existing rigs before expensive operations.
+	if err := beads.CheckPrefixAvailable(m.townRoot, opts.BeadsPrefix+"-", opts.Name); err != nil {
+		return nil, fmt.Errorf("prefix collision (derived prefix %q): %w", opts.BeadsPrefix, err)
+	}
+
 	localRepo, warn := resolveLocalRepo(opts.LocalRepo, opts.GitURL)
 	if warn != "" {
 		fmt.Printf("  Warning: %s\n", warn)
@@ -339,8 +378,20 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		return nil, fmt.Errorf("creating rig directory: %w", err)
 	}
 
-	// Track cleanup on failure (best-effort cleanup)
-	cleanup := func() { _ = os.RemoveAll(rigPath) }
+	// Stamp the directory so a stale rollback cannot delete a later,
+	// successful re-add of the same rig path.
+	ownershipStamp, err := newAddOwnershipStamp()
+	if err != nil {
+		_ = os.RemoveAll(rigPath)
+		return nil, fmt.Errorf("generating ownership stamp: %w", err)
+	}
+	if err := writeAddOwnershipStamp(rigPath, ownershipStamp); err != nil {
+		_ = os.RemoveAll(rigPath)
+		return nil, fmt.Errorf("writing ownership stamp: %w", err)
+	}
+
+	// Track cleanup on failure, but only if this invocation still owns the path.
+	cleanup := func() { removeRigPathIfOwned(rigPath, ownershipStamp) }
 	success := false
 	defer func() {
 		if !success {
@@ -371,30 +422,39 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// Mayor remains a separate clone (doesn't need branch visibility).
 	fmt.Printf("  Cloning repository (this may take a moment)...\n")
 	bareRepoPath := filepath.Join(rigPath, ".repo.git")
-	if opts.CloneFilter != "" && localRepo != "" {
-		if err := m.git.CloneBarePartialWithReference(opts.GitURL, bareRepoPath, opts.CloneFilter, localRepo); err != nil {
-			fmt.Printf("  Warning: could not use local repo reference with filter: %v\n", err)
-			_ = os.RemoveAll(bareRepoPath)
-			if err := m.git.CloneBarePartial(opts.GitURL, bareRepoPath, opts.CloneFilter); err != nil {
-				return nil, wrapCloneError(err, opts.GitURL)
+	// cloneBareWith selects the right CloneBare variant based on filter/reference/branch.
+	// When branch is non-empty, git clone --branch is passed so HEAD and the initial
+	// single-branch fetch both target the user-specified branch instead of the remote HEAD.
+	cloneBareWith := func(branch string) error {
+		if opts.CloneFilter != "" && localRepo != "" {
+			if err := m.git.CloneBarePartialWithReferenceAndBranch(opts.GitURL, bareRepoPath, opts.CloneFilter, localRepo, branch); err != nil {
+				fmt.Printf("  Warning: could not use local repo reference with filter: %v\n", err)
+				_ = os.RemoveAll(bareRepoPath)
+				return m.git.CloneBarePartialWithBranch(opts.GitURL, bareRepoPath, opts.CloneFilter, branch)
 			}
-		}
-	} else if opts.CloneFilter != "" {
-		if err := m.git.CloneBarePartial(opts.GitURL, bareRepoPath, opts.CloneFilter); err != nil {
-			return nil, wrapCloneError(err, opts.GitURL)
-		}
-	} else if localRepo != "" {
-		if err := m.git.CloneBareWithReference(opts.GitURL, bareRepoPath, localRepo); err != nil {
-			fmt.Printf("  Warning: could not use local repo reference: %v\n", err)
-			_ = os.RemoveAll(bareRepoPath)
-			if err := m.git.CloneBare(opts.GitURL, bareRepoPath); err != nil {
-				return nil, wrapCloneError(err, opts.GitURL)
+			return nil
+		} else if opts.CloneFilter != "" {
+			return m.git.CloneBarePartialWithBranch(opts.GitURL, bareRepoPath, opts.CloneFilter, branch)
+		} else if localRepo != "" {
+			if err := m.git.CloneBareWithReferenceAndBranch(opts.GitURL, bareRepoPath, localRepo, branch); err != nil {
+				fmt.Printf("  Warning: could not use local repo reference: %v\n", err)
+				_ = os.RemoveAll(bareRepoPath)
+				return m.git.CloneBareWithBranch(opts.GitURL, bareRepoPath, branch)
 			}
+			return nil
 		}
-	} else {
-		if err := m.git.CloneBare(opts.GitURL, bareRepoPath); err != nil {
-			return nil, wrapCloneError(err, opts.GitURL)
+		return m.git.CloneBareWithBranch(opts.GitURL, bareRepoPath, branch)
+	}
+
+	emptyRepoError := func() error {
+		return fmt.Errorf("repository %s is empty (no commits). Push at least one commit before adding it as a rig", opts.GitURL)
+	}
+
+	if err := cloneBareWith(opts.DefaultBranch); err != nil {
+		if hasRefs, refsErr := m.git.RemoteHasRefs(opts.GitURL); refsErr == nil && !hasRefs {
+			return nil, emptyRepoError()
 		}
+		return nil, wrapCloneError(err, opts.GitURL)
 	}
 	if opts.CloneFilter != "" {
 		fmt.Printf("   ✓ Created shared bare repo (partial: --filter=%s)\n", opts.CloneFilter)
@@ -409,7 +469,14 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	if empty, err := bareGit.IsEmpty(); err != nil {
 		return nil, fmt.Errorf("checking if repository is empty: %w", err)
 	} else if empty {
-		return nil, fmt.Errorf("repository %s is empty (no commits). Push at least one commit before adding it as a rig", opts.GitURL)
+		hasRefs, refsErr := m.git.RemoteHasRefs(opts.GitURL)
+		if refsErr != nil {
+			return nil, fmt.Errorf("checking if repository is empty: %w", refsErr)
+		}
+		if !hasRefs {
+			return nil, emptyRepoError()
+		}
+		return nil, fmt.Errorf("repository %s has refs, but no default branch could be cloned. Ensure the remote HEAD points to a branch, or pass --branch <branch>", opts.GitURL)
 	}
 
 	// Configure push URL if provided (for read-only upstream repos)
@@ -545,41 +612,46 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		// When metadata.json exists but the Dolt server database doesn't (fresh clone
 		// to a new workspace), we still need to run bd init to create the server-side
 		// database and set issue_prefix. Always ensure issue_prefix is set afterward.
+		sourceBdEnv := bdSubprocessEnv(sourceBeadsDir, opts.Name)
 		if !bdDatabaseExists(sourceBeadsDir) {
 			initArgs := []string{"init"}
 			if opts.BeadsPrefix != "" {
 				initArgs = append(initArgs, "--prefix", opts.BeadsPrefix)
 			}
+			if opts.Name != "" {
+				initArgs = append(initArgs, "--database", opts.Name)
+			}
 			initArgs = append(initArgs, "--server")
 			// Always pass --server-port so bd connects to gt's central Dolt
 			// server. Without this, bd auto-starts its own server on a random
 			// port, causing "database not found" errors. (GH #2405)
-			doltCfg := doltserver.DefaultConfig(m.townRoot)
-			initArgs = append(initArgs, "--server-port", strconv.Itoa(doltCfg.Port))
+			initArgs = append(initArgs, "--server-port", strconv.Itoa(bdInitServerPort(m.townRoot)))
+			// If the cloned repo's config.yaml has sync.remote, bd init blocks
+			// waiting for interactive confirmation (stdin is /dev/null here).
+			// Pass explicit flags to bypass the safety check. (GH #3873)
+			if beadsConfigHasSyncRemote(sourceBeadsConfig) {
+				initArgs = append(initArgs,
+					"--reinit-local",
+					"--discard-remote",
+					"--destroy-token=DESTROY-"+opts.BeadsPrefix,
+				)
+			}
 			cmd := exec.Command("bd", initArgs...)
 			cmd.Dir = mayorRigPath
+			cmd.Env = sourceBdEnv
 			if output, err := cmd.CombinedOutput(); err != nil {
 				fmt.Printf("  Warning: Could not init bd database: %v (%s)\n", err, strings.TrimSpace(string(output)))
 			}
-			// Drop orphaned beads_<prefix> database if it differs from rigName (gt-sv1h).
-			if orphanDB := "beads_" + opts.BeadsPrefix; orphanDB != opts.Name {
-				_ = doltserver.RemoveDatabase(m.townRoot, orphanDB, true)
+			// Drop orphan databases created by bd init (gh#3562, gt-sv1h).
+			// See dropRigOrphanDBs for naming details across bd versions.
+			if err := dropRigOrphanDBs(m.townRoot, opts.BeadsPrefix, opts.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: orphan database cleanup: %v\n", err)
 			}
 		}
 
-		// Always ensure issue_prefix and custom types are configured, even when
-		// metadata.json was tracked in git (bdDatabaseExists returned true).
-		// The tracked metadata.json tells bd HOW to connect but doesn't guarantee
-		// the server-side database has issue_prefix set for this workspace.
-		configCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
-		configCmd.Dir = mayorRigPath
-		_, _ = configCmd.CombinedOutput() // Ignore errors - older beads don't need this
-
-		prefixSetCmd := exec.Command("bd", "config", "set", "issue_prefix", opts.BeadsPrefix)
-		prefixSetCmd.Dir = mayorRigPath
-		if prefixOutput, prefixErr := prefixSetCmd.CombinedOutput(); prefixErr != nil {
-			fmt.Printf("  Warning: Could not set issue_prefix: %v (%s)\n", prefixErr, strings.TrimSpace(string(prefixOutput)))
-		}
+		// Do not mutate source repo config.yaml here: tracked-beads source repos
+		// must remain clean after rig add. Canonical rig config is written below
+		// after the shared rig .beads directory and metadata are established.
 	}
 
 	// NOTE: No per-directory CLAUDE.md/AGENTS.md is created for any agent.
@@ -617,28 +689,31 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		fmt.Printf("  Run 'gt doctor --fix' to repair, or it will self-heal on next daemon start.\n")
 	}
 
-	// Safety-net: drop orphaned beads_<prefix> database if it differs from rigName (gt-sv1h).
-	// InitBeads already does this, but repeat here in case EnsureMetadata path diverges.
-	if orphanDB := "beads_" + opts.BeadsPrefix; orphanDB != opts.Name {
-		_ = doltserver.RemoveDatabase(m.townRoot, orphanDB, true)
+	// Safety-net: drop orphan databases that may have been created by bd init.
+	// InitBeads already does this, but repeat here in case EnsureMetadata path
+	// diverges, and verify post-condition: no orphan should remain (gh#3562).
+	if err := dropRigOrphanDBs(m.townRoot, opts.BeadsPrefix, opts.Name); err != nil {
+		return nil, fmt.Errorf("rig init left a duplicate Dolt database: %w", err)
 	}
 
-	// Set issue_prefix on the correct server-side database.
-	// InitBeads ran bd config set issue_prefix, but against the wrong database
-	// (beads_<prefix> from bd init, not <rigName> from the centralized server).
-	// Now that EnsureMetadata has corrected dolt_database, re-set it.
+	// Set issue_prefix on the correct server-side database. bd 1.0+ rejects
+	// `bd config set issue_prefix`, so write both config.yaml and Dolt config
+	// directly after metadata points at the canonical rig database.
 	{
-		resolvedBeadsDir := beads.ResolveBeadsDir(rigPath)
-		prefixCmd := exec.Command("bd", "config", "set", "issue_prefix", opts.BeadsPrefix)
-		prefixCmd.Dir = rigPath
-		prefixCmd.Env = append(os.Environ(), "BEADS_DIR="+resolvedBeadsDir)
-		if out, err := prefixCmd.CombinedOutput(); err != nil {
-			fmt.Printf("  Warning: Could not set issue_prefix on rig database: %v (%s)\n", err, strings.TrimSpace(string(out)))
+		rigRootBeadsDir := filepath.Join(rigPath, ".beads")
+		resolvedBeadsDir := beads.ResolveBeadsDir(rigRootBeadsDir)
+		if _, err := os.Stat(filepath.Join(rigRootBeadsDir, "redirect")); os.IsNotExist(err) {
+			if err := beads.EnsureConfigYAMLValue(resolvedBeadsDir, "issue-prefix", opts.BeadsPrefix); err != nil {
+				fmt.Printf("  Warning: Could not set issue-prefix in config.yaml: %v\n", err)
+			}
+			_ = beads.EnsureConfigYAMLValue(resolvedBeadsDir, "types.custom", constants.BeadsCustomTypes)
+			_ = beads.EnsureConfigYAMLValue(resolvedBeadsDir, "types.infra", constants.BeadsInfraTypes)
 		}
-		typesCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
-		typesCmd.Dir = rigPath
-		typesCmd.Env = append(os.Environ(), "BEADS_DIR="+resolvedBeadsDir)
-		_, _ = typesCmd.CombinedOutput()
+		if err := beads.EnsureDoltConfigValue(resolvedBeadsDir, "issue_prefix", opts.BeadsPrefix); err != nil {
+			fmt.Printf("  Warning: Could not set issue_prefix in rig database: %v\n", err)
+		}
+		_ = beads.EnsureDoltConfigValue(resolvedBeadsDir, "types.custom", constants.BeadsCustomTypes)
+		_ = beads.EnsureDoltConfigValue(resolvedBeadsDir, "types.infra", constants.BeadsInfraTypes)
 	}
 
 	// Auto-create DoltHub remote for the rig's beads database.
@@ -742,8 +817,18 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 	if err := os.MkdirAll(polecatsPath, 0755); err != nil {
 		return nil, fmt.Errorf("creating polecats dir: %w", err)
 	}
-	// Use the default agent preset for scaffolding
-	defaultPreset := config.GetAgentPreset(config.DefaultAgentPreset())
+	// Use the town's default_agent for scaffolding, falling back to claude.
+	// This ensures that when the town is configured with opencode (or another agent),
+	// the polecat directory gets the correct config dir (e.g. .opencode/) instead of .claude/.
+	townSettings, tsErr := config.LoadOrCreateTownSettings(config.TownSettingsPath(m.townRoot))
+	if tsErr != nil {
+		townSettings = config.NewTownSettings()
+	}
+	defaultAgentName := townSettings.DefaultAgent
+	if defaultAgentName == "" {
+		defaultAgentName = string(config.AgentClaude)
+	}
+	defaultPreset := config.GetAgentPresetByName(defaultAgentName)
 	if defaultPreset != nil && defaultPreset.HooksProvider != "" {
 		if err := hooks.InstallForRole(defaultPreset.HooksProvider, polecatsPath, polecatsPath, "polecat",
 			defaultPreset.HooksDir, defaultPreset.HooksSettingsFile, defaultPreset.HooksUseSettingsDir); err != nil {
@@ -751,7 +836,7 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 			fmt.Printf("  %s Could not scaffold polecat settings: %v\n", "!", err)
 		}
 	}
-	if err := commands.ProvisionFor(polecatsPath, "claude"); err != nil {
+	if err := commands.ProvisionFor(polecatsPath, defaultAgentName); err != nil {
 		// Non-fatal: commands are convenience, not critical
 		fmt.Printf("  %s Could not scaffold polecat commands: %v\n", "!", err)
 	}
@@ -779,6 +864,12 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 	if err := os.MkdirAll(rigSettingsPath, 0755); err != nil {
 		return nil, fmt.Errorf("creating settings dir: %w", err)
 	}
+
+	// Note: we intentionally do NOT seed local rig settings from
+	// .gastown/settings.json here. Repo settings are merged at runtime
+	// by loadRigCommandVars (repo defaults → local overrides → --var flags).
+	// Seeding at rig-add time would fork the config, silently shadowing
+	// any future repo-side updates.
 
 	// Create rig-level agent beads (witness, refinery) in rig beads.
 	// Town-level agents (mayor, deacon) are created by gt install in town beads.
@@ -811,8 +902,131 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 		},
 	}
 
+	// Post-init identity verification (gas-tc4): verify metadata.json points
+	// to the correct database. This catches identity mismatches caused by bd init
+	// writing the wrong database name, before the rig is considered ready.
+	if err := m.verifyRigIdentity(rigPath, opts.Name); err != nil {
+		// Non-fatal but loud: the rig was created, but identity may be wrong.
+		// gt doctor --fix can repair this.
+		fmt.Fprintf(os.Stderr, "  ⚠ Identity verification warning: %v\n", err)
+		fmt.Fprintf(os.Stderr, "  Run 'gt doctor --fix' to repair if needed.\n")
+	}
+
+	// Persist rigs.json atomically before marking success.
+	// This ensures directory creation and rigs.json registration are an atomic unit:
+	// if the save fails, success remains false and the deferred cleanup removes the dir.
+	// Without this, a failure after AddRig returns (but before the caller saves) would
+	// leave a directory that is not registered in rigs.json.
+	rigsPath := filepath.Join(m.townRoot, "mayor", "rigs.json")
+	if err := config.SaveRigsConfig(rigsPath, m.config); err != nil {
+		return nil, fmt.Errorf("registering rig in rigs.json: %w", err)
+	}
+
 	success = true
+	// Best-effort cleanup: once the add succeeds, the stamp is no longer needed.
+	_ = clearAddOwnershipStamp(rigPath)
 	return m.loadRig(opts.Name, m.config.Rigs[opts.Name])
+}
+
+// addOwnershipStampFile marks which AddRig invocation currently owns the path.
+const addOwnershipStampFile = ".gt-add-owner"
+
+func newAddOwnershipStamp() (string, error) {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf[:]), nil
+}
+
+func writeAddOwnershipStamp(rigPath, stamp string) error {
+	return os.WriteFile(filepath.Join(rigPath, addOwnershipStampFile), []byte(stamp), 0644)
+}
+
+func readAddOwnershipStamp(rigPath string) string {
+	data, err := os.ReadFile(filepath.Join(rigPath, addOwnershipStampFile))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func clearAddOwnershipStamp(rigPath string) error {
+	return os.Remove(filepath.Join(rigPath, addOwnershipStampFile))
+}
+
+// removeRigPathIfOwned only removes a path if this AddRig invocation still owns
+// it. Missing stamps are only removed when the directory is empty, which avoids
+// deleting a later successful re-add that already cleared its own stamp.
+func removeRigPathIfOwned(rigPath, expectedStamp string) {
+	if expectedStamp == "" {
+		_ = os.RemoveAll(rigPath)
+		return
+	}
+
+	onDisk := readAddOwnershipStamp(rigPath)
+	if onDisk == expectedStamp {
+		_ = os.RemoveAll(rigPath)
+		return
+	}
+
+	if onDisk == "" {
+		if entries, err := os.ReadDir(rigPath); err == nil && len(entries) == 0 {
+			_ = os.RemoveAll(rigPath)
+			return
+		}
+		fmt.Fprintf(os.Stderr,
+			"  Warning: skipping rollback of %s because ownership stamp is missing and directory is non-empty (gh#3683 protection)\n",
+			rigPath)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr,
+		"  Warning: skipping rollback of %s because another rig add now owns this path (gh#3683 protection)\n",
+		rigPath)
+}
+
+// verifyRigIdentity checks that metadata.json points to the correct Dolt database
+// for this rig. This catches identity mismatches early — before polecats are spawned
+// and get stuck in retry loops. (gas-tc4)
+func (m *Manager) verifyRigIdentity(rigPath, rigName string) error {
+	resolvedBeadsDir := beads.ResolveBeadsDir(rigPath)
+	metadataPath := filepath.Join(resolvedBeadsDir, "metadata.json")
+
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // No metadata.json yet — will be created later
+		}
+		return fmt.Errorf("reading metadata.json: %w", err)
+	}
+
+	var metadata struct {
+		DoltDatabase string `json:"dolt_database"`
+		DoltMode     string `json:"dolt_mode"`
+	}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return fmt.Errorf("parsing metadata.json: %w", err)
+	}
+
+	if metadata.DoltMode != "server" {
+		return nil // Not using server mode, skip check
+	}
+
+	// Verify the database name matches what we expect.
+	// The database should be named after the rig (e.g., "gastown") not after
+	// a bd init artifact (e.g., "beads_gt") or a stale value from another rig.
+	if metadata.DoltDatabase != "" && metadata.DoltDatabase != rigName {
+		fmt.Fprintf(os.Stderr, "   ⚠ metadata.json has dolt_database=%q (expected %q) — attempting repair\n",
+			metadata.DoltDatabase, rigName)
+		if repairErr := doltserver.EnsureMetadata(m.townRoot, rigName); repairErr != nil {
+			return fmt.Errorf("metadata.json has dolt_database=%q (expected %q) and auto-repair failed: %w",
+				metadata.DoltDatabase, rigName, repairErr)
+		}
+		fmt.Printf("   ✓ Repaired metadata.json identity (was %q, now %q)\n", metadata.DoltDatabase, rigName)
+	}
+
+	return nil
 }
 
 // saveRigConfig writes the rig configuration to config.json.
@@ -859,14 +1073,62 @@ func warnDeprecatedRigConfigKeys(data []byte, path string) {
 	}
 }
 
+// dropRigOrphanDBs drops orphan Dolt databases that bd init creates as a side
+// effect of `bd init --prefix <prefix>`. The orphan name depends on bd version:
+//
+//	bd >= 0.62: "<prefix>"        (e.g. "ma" for prefix=ma)
+//	bd <  0.62: "beads_<prefix>"  (e.g. "beads_ma")
+//
+// Either form must be removed when it differs from <rigName>, otherwise beads
+// created from the rig can silently land in the orphan DB while the mayor
+// reads from <rigName> — causing the silent data split documented in gh#3562.
+//
+// On entry the orphan is freshly created by bd init and contains only schema
+// tables, so it is safe to force-drop. If the candidate looks like a real rig
+// database (matches rigName, "hq", or doesn't exist at all) it is skipped.
+//
+// Returns an error only if at least one orphan candidate exists on disk and
+// cannot be removed — callers in AddRig treat that as fatal so the user is not
+// left with a silently-split rig.
+func dropRigOrphanDBs(townRoot, prefix, rigName string) error {
+	if prefix == "" || rigName == "" {
+		return nil
+	}
+	candidates := []string{prefix, "beads_" + prefix}
+	var failures []string
+	for _, name := range candidates {
+		if name == rigName || name == "hq" {
+			continue
+		}
+		if !doltserver.DatabaseExists(townRoot, name) {
+			continue
+		}
+		if err := doltserver.RemoveDatabase(townRoot, name, true); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", name, err))
+			continue
+		}
+		// Re-check: RemoveDatabase may report success but leave files behind
+		// in pathological cases (read-only server, partial DROP).
+		if doltserver.DatabaseExists(townRoot, name) {
+			failures = append(failures, fmt.Sprintf("%s: still present after RemoveDatabase", name))
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("orphan database(s) for rig %q (prefix %q) could not be removed: %s — run `gt dolt cleanup --force` to resolve",
+			rigName, prefix, strings.Join(failures, "; "))
+	}
+	return nil
+}
+
 // InitBeads initializes the beads database at rig level.
 // The project's .beads/config.yaml determines sync-branch settings.
 // Use `bd doctor --fix` in the project to configure sync-branch if needed.
 // TODO(bd-yaml): beads config should migrate to JSON (see beads issue)
 //
 // rigName is the rig's database name (e.g. "gastown"). When non-empty and
-// different from the default "beads_<prefix>" database that bd init creates,
-// InitBeads drops the orphan database to prevent accumulation (gt-sv1h).
+// different from the database that `bd init --prefix` creates (named "<prefix>"
+// on bd >= 0.62 or "beads_<prefix>" on older bd), InitBeads drops the orphan
+// to prevent the silent data split documented in gh#3562.
 func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 	// Validate prefix format to prevent command injection from config files
 	if !isValidBeadsPrefix(prefix) {
@@ -895,33 +1157,9 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 		return err
 	}
 
-	// Build environment with explicit BEADS_DIR to prevent bd from
-	// finding a parent directory's .beads/ database
-	env := os.Environ()
-	filteredEnv := make([]string, 0, len(env)+1)
-	for _, e := range env {
-		if !strings.HasPrefix(e, "BEADS_DIR=") {
-			filteredEnv = append(filteredEnv, e)
-		}
-	}
-	filteredEnv = append(filteredEnv, "BEADS_DIR="+beadsDir)
-
-	// Ensure BEADS_DOLT_PORT is set when GT_DOLT_PORT is present, so that
-	// bd subprocesses connect to the correct Dolt server (especially in tests
-	// where an ephemeral server runs on a non-default port).
-	var gtDoltPort string
-	hasBDP := false
-	for _, e := range filteredEnv {
-		if strings.HasPrefix(e, "GT_DOLT_PORT=") {
-			gtDoltPort = strings.TrimPrefix(e, "GT_DOLT_PORT=")
-		}
-		if strings.HasPrefix(e, "BEADS_DOLT_PORT=") {
-			hasBDP = true
-		}
-	}
-	if gtDoltPort != "" && !hasBDP {
-		filteredEnv = append(filteredEnv, "BEADS_DOLT_PORT="+gtDoltPort)
-	}
+	// Pin bd to the intended .beads directory/database through the shared
+	// hardened env builder so stale shell selectors cannot leak into rig init.
+	filteredEnv := bdSubprocessEnv(beadsDir, rigName)
 
 	// Run bd init if available (Dolt is the only backend since bd v0.51.0).
 	// --server tells bd to set dolt_mode=server in metadata.json so bd
@@ -930,11 +1168,15 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 	if prefix != "" {
 		initArgs = append(initArgs, "--prefix", prefix)
 	}
+	if rigName != "" {
+		initArgs = append(initArgs, "--database", rigName)
+	}
 	initArgs = append(initArgs, "--server")
 	// Always pass --server-port so bd connects to gt's central Dolt server.
 	// Without this, bd auto-starts its own server on a random port. (GH #2405)
-	doltCfg := doltserver.DefaultConfig(m.townRoot)
-	initArgs = append(initArgs, "--server-port", strconv.Itoa(doltCfg.Port))
+	initArgs = append(initArgs, "--server-port", strconv.Itoa(bdInitServerPort(m.townRoot)))
+	// --force ensures bd 1.0+ persists issue_prefix on existing server-side DBs.
+	initArgs = append(initArgs, "--force")
 	cmd := exec.Command("bd", initArgs...)
 	cmd.Dir = rigPath
 	cmd.Env = filteredEnv
@@ -945,37 +1187,57 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 	} else {
 		// bd init succeeded - configure the Dolt database
 
-		// Configure custom types for Gas Town (agent, role, rig, convoy).
-		// These were extracted from beads core in v0.46.0 and now require explicit config.
-		configCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
-		configCmd.Dir = rigPath
-		configCmd.Env = filteredEnv
-		// Ignore errors - older beads versions don't need this
-		_, _ = configCmd.CombinedOutput()
+		// Configure Gas Town bead types. Rig remains a custom durable type, not an
+		// infra/wisp type.
+		for _, cfg := range []struct{ key, value string }{
+			{"types.custom", constants.BeadsCustomTypes},
+			{"types.infra", constants.BeadsInfraTypes},
+		} {
+			configCmd := exec.Command("bd", "config", "set", cfg.key, cfg.value)
+			configCmd.Dir = rigPath
+			configCmd.Env = filteredEnv
+			// Ignore errors - older beads versions don't need this
+			_, _ = configCmd.CombinedOutput()
+		}
 
 		// Explicitly set issue_prefix config (bd init --prefix may not persist it in newer versions).
 		// Without this, bd create and gt sling fail with "issue_prefix config is missing".
+		// bd >= 1.0.0 rejects this with "cannot be set via 'bd config set'" because init persists
+		// it directly; treat that as already-set rather than a failure.
 		prefixSetCmd := exec.Command("bd", "config", "set", "issue_prefix", prefix)
 		prefixSetCmd.Dir = rigPath
 		prefixSetCmd.Env = filteredEnv
 		if prefixOutput, prefixErr := prefixSetCmd.CombinedOutput(); prefixErr != nil {
-			return fmt.Errorf("bd config set issue_prefix failed: %s", strings.TrimSpace(string(prefixOutput)))
+			out := strings.TrimSpace(string(prefixOutput))
+			if !strings.Contains(out, "cannot be set via") {
+				return fmt.Errorf("bd config set issue_prefix failed: %s", out)
+			}
 		}
 
-		// Drop the orphaned beads_<prefix> database created by bd init (gt-sv1h).
-		// bd init --prefix creates a database named beads_<prefix> on the Dolt server,
-		// but the rig uses <rigName> as its database (set by InitRig + EnsureMetadata).
-		// Without cleanup, orphans accumulate with every polecat spawn.
+		// Drop orphan databases created by bd init (gh#3562, gt-sv1h).
+		// bd init --prefix creates a database whose name depends on the bd version:
+		//   bd >= 0.62: "<prefix>"        (e.g. "ma" for prefix=ma)
+		//   bd <  0.62: "beads_<prefix>"  (e.g. "beads_ma")
+		// The rig uses <rigName> as its canonical database (set by InitRig +
+		// EnsureMetadata). Orphans must be dropped or beads created from the
+		// rig will silently land in the wrong DB and become invisible to the mayor.
 		if rigName != "" {
-			orphanDB := "beads_" + prefix
-			if orphanDB != rigName {
-				_ = doltserver.RemoveDatabase(m.townRoot, orphanDB, true)
+			if err := dropRigOrphanDBs(m.townRoot, prefix, rigName); err != nil {
+				// Non-fatal: AddRig has a post-init verification step that errors
+				// loudly if an orphan persists. Log here so the trail is visible
+				// when rig init is invoked outside AddRig.
+				fmt.Fprintf(os.Stderr, "Warning: orphan database cleanup: %v\n", err)
 			}
 		}
 	}
 
 	if err := beads.EnsureConfigYAML(beadsDir, prefix); err != nil {
 		return fmt.Errorf("ensuring config.yaml: %w", err)
+	}
+	if rigName != "" {
+		if err := doltserver.EnsureMetadataForBeadsDir(m.townRoot, beadsDir, rigName, rigName); err != nil {
+			return fmt.Errorf("ensuring metadata.json: %w", err)
+		}
 	}
 
 	// Ensure database has repository fingerprint (GH #25).
@@ -1201,6 +1463,26 @@ func isValidBeadsPrefix(prefix string) bool {
 	return beadsPrefixRegexp.MatchString(prefix)
 }
 
+func bdSubprocessEnv(beadsDir, database string) []string {
+	base := os.Environ()
+	if townRoot := beads.FindTownRoot(filepath.Dir(beads.ResolveBeadsDir(beadsDir))); townRoot != "" {
+		base = config.NormalizeConfiguredDoltEnv(base, townRoot)
+	}
+	env := beads.BuildMutationPinnedBDEnv(base, beadsDir)
+	if database != "" {
+		env = beads.StripEnvKey(env, "BEADS_DOLT_SERVER_DATABASE")
+		env = append(env, "BEADS_DOLT_SERVER_DATABASE="+database)
+	}
+	return env
+}
+
+func bdInitServerPort(townRoot string) int {
+	if port := config.ResolveConfiguredDoltPort(townRoot); port > 0 {
+		return port
+	}
+	return doltserver.DefaultPort
+}
+
 // isStandardBeadHash checks if a string looks like a standard 5-char bead hash.
 // Regular bead IDs use a 5-character base32-encoded hash (e.g., "mawit", "z0ixd").
 // This distinguishes regular issues from agent beads (suffix like "witness")
@@ -1290,6 +1572,28 @@ func detectBeadsPrefixFromConfig(configPath string) string {
 	}
 
 	return ""
+}
+
+// beadsConfigHasSyncRemote reports whether the given beads config.yaml contains
+// a non-empty sync.remote entry. bd init blocks waiting for interactive
+// confirmation when it detects this, so callers must pass --reinit-local
+// --discard-remote --destroy-token to suppress the prompt. (GH #3873)
+func beadsConfigHasSyncRemote(configPath string) bool {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "sync.remote:") {
+			value := strings.TrimSpace(strings.TrimPrefix(line, "sync.remote:"))
+			return strings.Trim(value, `"'`) != ""
+		}
+	}
+	return false
 }
 
 // RemoveRig unregisters a rig (does not delete files).
@@ -1389,6 +1693,11 @@ func (m *Manager) RegisterRig(opts RegisterRigOptions) (*RegisterRigResult, erro
 	}
 	if opts.BeadsPrefix != "" {
 		result.BeadsPrefix = opts.BeadsPrefix
+	}
+
+	// Check for prefix collision with existing rigs.
+	if err := beads.CheckPrefixAvailable(m.townRoot, result.BeadsPrefix+"-", opts.Name); err != nil {
+		return nil, fmt.Errorf("prefix collision (prefix %q): %w", result.BeadsPrefix, err)
 	}
 
 	// Determine push URL: explicit option > existing config > auto-detect from remotes.

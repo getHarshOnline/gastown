@@ -66,7 +66,7 @@ func TestDefaultWebTimeoutsConfig(t *testing.T) {
 		{"TmuxCmdTimeout", cfg.TmuxCmdTimeout, 0, 2 * time.Second},
 		{"FetchTimeout", cfg.FetchTimeout, 0, 8 * time.Second},
 		{"DefaultRunTimeout", cfg.DefaultRunTimeout, 0, 30 * time.Second},
-		{"MaxRunTimeout", cfg.MaxRunTimeout, 0, 60 * time.Second},
+		{"MaxRunTimeout", cfg.MaxRunTimeout, 0, 120 * time.Second},
 	}
 
 	for _, tt := range tests {
@@ -141,7 +141,7 @@ func TestWebTimeoutsConfig_JSONRoundTrip(t *testing.T) {
 		TmuxCmdTimeout:    "3s",
 		FetchTimeout:      "12s",
 		DefaultRunTimeout: "45s",
-		MaxRunTimeout:      "90s",
+		MaxRunTimeout:     "90s",
 	}
 
 	data, err := json.Marshal(original)
@@ -542,6 +542,47 @@ func TestFeedCuratorConfig_OmitemptyZeroCount(t *testing.T) {
 	}
 }
 
+func TestTownSettings_DisabledPatrols_RoundTrip(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+	settingsPath := filepath.Join(tmpDir, "config.json")
+
+	original := NewTownSettings()
+	original.DisabledPatrols = []string{"doctor_dog", "compactor_dog", "witness"}
+
+	if err := SaveTownSettings(settingsPath, original); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	loaded, err := LoadOrCreateTownSettings(settingsPath)
+	if err != nil {
+		t.Fatalf("LoadOrCreateTownSettings: %v", err)
+	}
+
+	if len(loaded.DisabledPatrols) != 3 {
+		t.Fatalf("expected 3 disabled patrols, got %d", len(loaded.DisabledPatrols))
+	}
+
+	expected := map[string]bool{"doctor_dog": true, "compactor_dog": true, "witness": true}
+	for _, p := range loaded.DisabledPatrols {
+		if !expected[p] {
+			t.Errorf("unexpected disabled patrol: %q", p)
+		}
+	}
+}
+
+func TestTownSettings_DisabledPatrols_OmitemptyWhenNil(t *testing.T) {
+	t.Parallel()
+	ts := NewTownSettings()
+	data, err := json.MarshalIndent(ts, "", "  ")
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(data), "disabled_patrols") {
+		t.Error("JSON should not contain disabled_patrols when nil")
+	}
+}
+
 // --- Edge cases for config values ---
 
 func TestParseDurationOrDefault_AllWebTimeoutDefaults(t *testing.T) {
@@ -562,7 +603,7 @@ func TestParseDurationOrDefault_AllWebTimeoutDefaults(t *testing.T) {
 		{"TmuxCmdTimeout", empty.TmuxCmdTimeout, defaults.TmuxCmdTimeout, 2 * time.Second},
 		{"FetchTimeout", empty.FetchTimeout, defaults.FetchTimeout, 8 * time.Second},
 		{"DefaultRunTimeout", empty.DefaultRunTimeout, defaults.DefaultRunTimeout, 30 * time.Second},
-		{"MaxRunTimeout", empty.MaxRunTimeout, defaults.MaxRunTimeout, 60 * time.Second},
+		{"MaxRunTimeout", empty.MaxRunTimeout, defaults.MaxRunTimeout, 120 * time.Second},
 	}
 
 	for _, p := range pairs {
@@ -580,5 +621,3 @@ func TestParseDurationOrDefault_AllWebTimeoutDefaults(t *testing.T) {
 		})
 	}
 }
-
-

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -64,10 +63,10 @@ EXAMPLES:
 
   # Backoff mode with agent bead tracking:
   gt mol await-signal --agent-bead gt-gastown-witness \
-    --backoff-base 30s --backoff-mult 2 --backoff-max 5m
+    --backoff-base 30s --backoff-mult 2 --backoff-max 15m
 
   # On timeout, the agent bead's idle:N label is auto-incremented
-  # On signal, caller should reset: gt agent state gt-gastown-witness --set idle=0
+  # On signal, caller should reset: gt agents state gt-gastown-witness --set idle=0
 
   # Quiet mode (no output, for scripting)
   gt mol await-signal --timeout 30s --quiet`,
@@ -87,10 +86,11 @@ var moleculeAwaitSignalShortcutCmd = &cobra.Command{
 
 // AwaitSignalResult is the result of an await-signal operation.
 type AwaitSignalResult struct {
-	Reason     string        `json:"reason"`               // "signal" or "timeout"
-	Elapsed    time.Duration `json:"elapsed"`              // how long we waited
-	Signal     string        `json:"signal,omitempty"`     // the line that woke us (if signal)
-	IdleCycles int           `json:"idle_cycles,omitempty"` // current idle cycle count (after update)
+	Reason      string        `json:"reason"`                // "signal" or "timeout"
+	Elapsed     time.Duration `json:"elapsed"`               // how long we waited
+	Signal      string        `json:"signal,omitempty"`      // the line that woke us (if signal)
+	IdleCycles  int           `json:"idle_cycles,omitempty"` // current idle cycle count (after update)
+	EffortLevel string        `json:"effort_level"`          // "full" or "abbreviated"
 }
 
 func init() {
@@ -133,7 +133,7 @@ func init() {
 
 func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	// Find beads directory (rig-local for bead operations)
-	workDir, err := findLocalBeadsDir()
+	beadsDir, err := resolveAgentTrackingBeadsDir()
 	if err != nil {
 		return fmt.Errorf("not in a beads workspace: %w", err)
 	}
@@ -143,8 +143,6 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
-
-	beadsDir := beads.ResolveBeadsDir(workDir)
 
 	// Read current idle cycles and backoff window from agent bead (if specified)
 	var idleCycles int
@@ -265,6 +263,15 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 		_ = clearAgentBackoffUntil(awaitSignalAgentBead, beadsDir)
 	}
 
+	// Set effort level based on idle cycles.
+	// On signal (activity detected) or first cycle (idle=0): full effort.
+	// On timeout with idle > 0: abbreviated effort (skip optional patrol steps).
+	if result.Reason == "signal" || result.IdleCycles == 0 {
+		result.EffortLevel = "full"
+	} else {
+		result.EffortLevel = "abbreviated"
+	}
+
 	// Output result
 	if moleculeJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -294,6 +301,15 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 					style.Dim.Render("⏱"), result.Elapsed.Round(time.Millisecond))
 			}
 		}
+
+		// Output effort recommendation for the next patrol cycle.
+		if result.EffortLevel == "abbreviated" {
+			fmt.Printf("\n%s Run ABBREVIATED patrol: quick checks only, skip optional steps.\n",
+				style.Bold.Render("EFFORT: reduced"))
+		} else {
+			fmt.Printf("\n%s Run full patrol.\n",
+				style.Bold.Render("EFFORT: full"))
+		}
 	}
 
 	return nil
@@ -301,7 +317,9 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 
 // calculateEffectiveTimeout determines the timeout based on flags.
 // If backoff parameters are provided, uses exponential backoff formula:
-//   min(base * multiplier^idleCycles, max)
+//
+//	min(base * multiplier^idleCycles, max)
+//
 // Otherwise uses the simple --timeout value.
 func calculateEffectiveTimeout(idleCycles int) (time.Duration, error) {
 	// If backoff base is set, use backoff mode
@@ -311,21 +329,27 @@ func calculateEffectiveTimeout(idleCycles int) (time.Duration, error) {
 			return 0, fmt.Errorf("invalid backoff-base: %w", err)
 		}
 
-		// Apply exponential backoff: base * multiplier^idleCycles
-		timeout := base
-		for i := 0; i < idleCycles; i++ {
-			timeout *= time.Duration(awaitSignalBackoffMult)
-		}
-
-		// Apply max cap if specified
+		// Apply exponential backoff: base * multiplier^idleCycles, capped at max.
+		// Parse max first so we can cap early inside the loop and prevent
+		// int64 overflow — time.Duration wraps negative around idle ~62+.
+		var maxDur time.Duration
 		if awaitSignalBackoffMax != "" {
-			maxDur, err := time.ParseDuration(awaitSignalBackoffMax)
+			maxDur, err = time.ParseDuration(awaitSignalBackoffMax)
 			if err != nil {
 				return 0, fmt.Errorf("invalid backoff-max: %w", err)
 			}
-			if timeout > maxDur {
-				timeout = maxDur
+		}
+
+		timeout := base
+		for i := 0; i < idleCycles; i++ {
+			// Cap early to prevent int64 overflow at high idle counts.
+			if maxDur > 0 && timeout >= maxDur {
+				return maxDur, nil
 			}
+			timeout *= time.Duration(awaitSignalBackoffMult)
+		}
+		if maxDur > 0 && timeout > maxDur {
+			return maxDur, nil
 		}
 
 		return timeout, nil
@@ -402,11 +426,35 @@ func parseIntSimple(s string) (int, error) {
 	return n, nil
 }
 
-// updateAgentHeartbeat updates the last_activity timestamp on an agent bead.
-// This proves the agent is alive and processing signals.
+// updateAgentHeartbeat records a heartbeat timestamp on an agent bead via a
+// heartbeat:EPOCH label. This proves the agent is alive during long idle periods.
+//
+// bd agent heartbeat was never shipped (steveyegge/beads#2828). We use the same
+// read-modify-write label pattern as setAgentIdleCycles instead.
 func updateAgentHeartbeat(agentBead, beadsDir string) error {
-	cmd := exec.Command("bd", "agent", "heartbeat", agentBead)
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	allLabels, err := getAllAgentLabels(agentBead, beadsDir)
+	if err != nil {
+		return err
+	}
+
+	var newLabels []string
+	for _, label := range allLabels {
+		if len(label) > 10 && label[:10] == "heartbeat:" {
+			continue // Replace existing heartbeat label
+		}
+		newLabels = append(newLabels, label)
+	}
+	newLabels = append(newLabels, fmt.Sprintf("heartbeat:%d", time.Now().Unix()))
+
+	args := []string{"update", agentBead}
+	for _, label := range newLabels {
+		args = append(args, "--set-labels="+label)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), bdCallTimeout)
+	defer cancel()
+
+	cmd := beads.CommandContext(ctx, filepath.Dir(beadsDir), beadsDir, beads.MutationPinned, args...)
 	return cmd.Run()
 }
 
@@ -438,8 +486,10 @@ func setAgentIdleCycles(agentBead, beadsDir string, cycles int) error {
 		args = append(args, "--set-labels="+label)
 	}
 
-	cmd := exec.Command("bd", args...)
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	ctx, cancel := context.WithTimeout(context.Background(), bdCallTimeout)
+	defer cancel()
+
+	cmd := beads.CommandContext(ctx, filepath.Dir(beadsDir), beadsDir, beads.MutationPinned, args...)
 
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("setting idle label: %w", err)
@@ -471,8 +521,10 @@ func setAgentBackoffUntil(agentBead, beadsDir string, until time.Time) error {
 		args = append(args, "--set-labels="+label)
 	}
 
-	cmd := exec.Command("bd", args...)
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	ctx, cancel := context.WithTimeout(context.Background(), bdCallTimeout)
+	defer cancel()
+
+	cmd := beads.CommandContext(ctx, filepath.Dir(beadsDir), beadsDir, beads.MutationPinned, args...)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("setting backoff-until label: %w", err)
 	}
@@ -510,8 +562,10 @@ func clearAgentBackoffUntil(agentBead, beadsDir string) error {
 		}
 	}
 
-	cmd := exec.Command("bd", args...)
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	ctx, cancel := context.WithTimeout(context.Background(), bdCallTimeout)
+	defer cancel()
+
+	cmd := beads.CommandContext(ctx, filepath.Dir(beadsDir), beadsDir, beads.MutationPinned, args...)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("clearing backoff-until label: %w", err)
 	}

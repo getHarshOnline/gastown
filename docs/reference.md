@@ -6,13 +6,14 @@ Technical reference for Gas Town internals. Read the README first.
 
 ## Beads Routing
 
-Gas Town routes beads commands based on issue ID prefix. You don't need to think
-about which database to use - just use the issue ID.
+Gas Town `gt` commands route beads work based on issue ID prefix. For direct
+`bd` commands, run from the owning repository/root so the active `.beads`
+directory matches the database you intend to touch.
 
 ```bash
-bd show gp-xyz    # Routes to greenplace rig's beads
-bd show hq-abc    # Routes to town-level beads
-bd show wyv-123   # Routes to wyvern rig's beads
+bd -C ~/gt/greenplace/mayor/rig show gp-xyz  # Greenplace rig beads
+bd -C ~/gt show hq-abc                       # Town-level beads
+bd -C ~/gt/wyvern/mayor/rig show wyv-123     # Wyvern rig beads
 ```
 
 **How it works**: Routes are defined in `~/gt/.beads/routes.jsonl`. Each rig's
@@ -24,7 +25,11 @@ prefix maps to its beads location (the mayor's clone in that rig).
 | `gp-*` | `~/gt/greenplace/mayor/rig/.beads/` | Greenplace project issues |
 | `wyv-*` | `~/gt/wyvern/mayor/rig/.beads/` | Wyvern project issues |
 
-Debug routing: `BD_DEBUG_ROUTING=1 bd show <id>`
+Debug routing: `BD_DEBUG_ROUTING=1 bd -C <owning-root> show <id>`
+
+`bd --global` is not Gas Town's town database. In Beads it targets a separate
+shared-server database named `beads_global`; run `bd -C ~/gt ...` for
+town-level Gas Town beads.
 
 ## Configuration
 
@@ -50,14 +55,26 @@ Debug routing: `BD_DEBUG_ROUTING=1 bd show <id>`
 
 ```json
 {
-  "theme": "desert",
+  "theme": {
+    "disabled": false,
+    "name": "forest",
+    "custom": {
+      "bg": "#111111",
+      "fg": "#eeeeee"
+    },
+    "role_themes": {
+      "witness": "rust",
+      "refinery": "plum",
+      "crew": "none"
+    }
+  },
   "merge_queue": {
     "enabled": true,
     "run_tests": true,
     "setup_command": "",
     "typecheck_command": "",
     "lint_command": "",
-    "test_command": "go test ./...",
+    "test_command": "",
     "build_command": "",
     "on_conflict": "assign_back",
     "delete_merged_branches": true,
@@ -72,6 +89,46 @@ Debug routing: `BD_DEBUG_ROUTING=1 bd show <id>`
 }
 ```
 
+**Theme fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `disabled` | `bool` | `false` | Disable tmux status/window theming for the rig |
+| `name` | `string` | auto-assigned by rig name | Use a named built-in palette theme |
+| `custom.bg` | `string` | unset | Custom tmux background color |
+| `custom.fg` | `string` | unset | Custom tmux foreground color |
+| `role_themes` | `map[string]string` | unset | Per-role overrides for `witness`, `refinery`, `crew`, `polecat`; use `"none"` to disable theming for a role |
+
+Theme resolution:
+- No `theme` config: auto-assign a built-in palette theme by rig name
+- `disabled: true`: skip both `status-style` and `window-style`
+- `name`: use that built-in theme
+- `custom`: use exact `{bg, fg}` colors
+- `role_themes`: override role-specific sessions within the rig
+
+Town-level role defaults live in `mayor/config.json` under:
+
+```json
+{
+  "theme": {
+    "disabled": false,
+    "name": "forest",
+    "custom": {
+      "bg": "#111111",
+      "fg": "#eeeeee"
+    },
+    "role_defaults": {
+      "mayor": "forest",
+      "deacon": "plum",
+      "witness": "rust",
+      "crew": "none"
+    }
+  }
+}
+```
+
+`role_defaults` supports `mayor`, `deacon`, `witness`, `refinery`, `crew`, and `polecat`.
+
 **Merge queue fields:**
 
 | Field | Type | Default | Description |
@@ -81,7 +138,7 @@ Debug routing: `BD_DEBUG_ROUTING=1 bd show <id>`
 | `setup_command` | `string` | `""` | Setup/install command (e.g., `pnpm install`) |
 | `typecheck_command` | `string` | `""` | Type check command (e.g., `tsc --noEmit`) |
 | `lint_command` | `string` | `""` | Lint command (e.g., `eslint .`) |
-| `test_command` | `string` | `"go test ./..."` | Test command to run |
+| `test_command` | `string` | `""` | Test command to run. Empty = skip. |
 | `build_command` | `string` | `""` | Build command (e.g., `go build ./...`) |
 | `on_conflict` | `string` | `"assign_back"` | Conflict strategy: `assign_back` or `auto_rebase` |
 | `delete_merged_branches` | `bool` | `true` | Delete source branches after merging |
@@ -135,7 +192,7 @@ bd update gt-rig-myrig --labels="polecat_branch_template:adam/{year}/{month}/{de
 **Default Behavior (backward compatible):**
 
 When `polecat_branch_template` is empty or not set:
-- With issue: `polecat/{name}/{issue}@{timestamp}`
+- With issue: `polecat/{name}/{issue}+{timestamp}`
 - Without issue: `polecat/{name}-{timestamp}`
 
 **Example Configurations:**
@@ -203,8 +260,8 @@ with = "macro-formula"
 ```
 1. Work through formula checklist (shown inline by gt prime)
 2. Submit to merge queue via gt done
-3. gt done nukes sandbox and exits
-4. Witness removes worktree + branch
+3. gt done preserves branch/MR metadata and exits the session
+4. Witness/refinery cleanup handles any retired sandbox state
 ```
 
 ### Session Cycling
@@ -404,7 +461,17 @@ gt config agent remove <name>     # Remove custom agent (built-ins protected)
 gt config default-agent [name]    # Get or set town default agent
 ```
 
-**Built-in agents**: `claude`, `gemini`, `codex`, `cursor`, `auggie`, `amp`
+**Built-in agents**: `claude`, `gemini`, `codex`, `kiro`, `cursor`, `auggie`, `amp`, `opencode`, `copilot`
+
+The `kiro` preset launches `kiro-cli chat --trust-all-tools` and uses Kiro's
+documented `--resume` / `--resume-id` session flags. Gas Town does not install
+Kiro hooks or `.kiro` project files for this preset.
+
+> **Note on GitHub Copilot**: The `copilot` preset uses executable lifecycle hooks in
+> `.github/hooks/gastown.json` (`sessionStart`, `userPromptSubmitted`, `preToolUse`,
+> `sessionEnd`) — the same lifecycle events as Claude Code, in Copilot's JSON format.
+> Copilot uses a 5-second ready delay instead of prompt-based detection. Requires a
+> Copilot seat and org-level CLI policy enabled.
 
 **Custom agents**: Define per-town via CLI or JSON:
 ```bash

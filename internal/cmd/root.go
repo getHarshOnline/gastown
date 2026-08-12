@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -22,10 +23,10 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:     "gt", // Updated in init() based on GT_COMMAND
-	Short:   "Gas Town - Multi-agent workspace manager",
-	Version: Version,
-	Long:    "", // Updated in init() based on GT_COMMAND
+	Use:               "gt", // Updated in init() based on GT_COMMAND
+	Short:             "Gas Town - Multi-agent workspace manager",
+	Version:           Version,
+	Long:              "", // Updated in init() based on GT_COMMAND
 	PersistentPreRunE: persistentPreRun,
 }
 
@@ -42,48 +43,56 @@ across distributed teams of AI agents working on shared codebases.`, cmdName)
 // Commands that don't require beads to be installed/checked.
 // These commands should work even when bd is missing or outdated.
 var beadsExemptCommands = map[string]bool{
-	"version":    true,
-	"help":       true,
-	"completion": true,
-	"crew":       true,
-	"polecat":    true,
-	"witness":    true,
-	"refinery":   true,
-	"status":     true,
-	"mail":       true,
-	"hook":       true,
-	"prime":      true,
-	"nudge":      true,
-	"seance":     true,
-	"doctor":     true,
-	"dolt":       true,
-	"handoff":    true,
-	"costs":      true,
-	"feed":       true,
-	"rig":        true,
-	"config":     true,
-	"install":    true,
-	"tap":        true,
-	"dnd":        true,
+	"version":       true,
+	"help":          true,
+	"completion":    true,
+	"crew":          true,
+	"polecat":       true,
+	"witness":       true,
+	"refinery":      true,
+	"status":        true,
+	"status-line":   true,
+	"mail":          true,
+	"hook":          true,
+	"prime":         true,
+	"nudge":         true,
+	"seance":        true,
+	"doctor":        true,
+	"dolt":          true,
+	"handoff":       true,
+	"costs":         true,
+	"feed":          true,
+	"rig":           true,
+	"scheduler":     true,
+	"config":        true,
+	"install":       true,
+	"tap":           true,
+	"dnd":           true,
+	"estop":         true, // E-stop must work when Dolt is down
+	"thaw":          true, // Thaw must work when Dolt is down
 	"signal":        true, // Hook signal handlers must be fast, handle beads internally
 	"metrics":       true, // Metrics reads local JSONL, no beads needed
 	"krc":           true, // KRC doesn't require beads
-	"run-migration":       true, // Migration orchestrator handles its own beads checks
-	"health":              true, // Health check doesn't require beads
-	"upgrade":             true, // Post-install migration orchestrator
-	"heartbeat":           true, // Heartbeat state update — must be fast and dependency-free
+	"run-migration": true, // Migration orchestrator handles its own beads checks
+	"health":        true, // Health check doesn't require beads
+	"upgrade":       true, // Post-install migration orchestrator
+	"heartbeat":     true, // Heartbeat state update — must be fast and dependency-free
 }
 
 // Commands exempt from the town root branch warning.
 // These are commands that help fix the problem or are diagnostic.
 var branchCheckExemptCommands = map[string]bool{
-	"version":    true,
-	"help":       true,
-	"completion": true,
-	"doctor":     true, // Used to fix the problem
-	"install":    true, // Initial setup
-	"git-init":   true, // Git setup
-	"upgrade":    true, // Post-install migration
+	"version":     true,
+	"help":        true,
+	"completion":  true,
+	"doctor":      true, // Used to fix the problem
+	"status-line": true, // tmux hot path; never run git freshness checks here
+	"estop":       true, // Emergency stop must always work
+	"thaw":        true, // Thaw must always work
+	"install":     true, // Initial setup
+	"git-init":    true, // Git setup
+	"upgrade":     true, // Post-install migration
+	"scheduler":   true, // Daemon hot path; scheduler handles beads internally
 }
 
 // persistentPreRun runs before every command.
@@ -93,16 +102,24 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	// Warning only - doesn't block execution.
 	// Skip warning when Build was set by a package manager (e.g. Homebrew sets
 	// Build to "Homebrew" via ldflags but doesn't set BuiltProperly).
-	if BuiltProperly == "" && Build == "dev" {
-		fmt.Fprintln(os.Stderr, "WARNING: This binary was built with 'go build' directly.")
-		fmt.Fprintln(os.Stderr, "         Use 'make build' to create a properly signed binary.")
+	if BuiltProperly == "" && Build == "dev" && runtime.GOOS == "darwin" {
+		fmt.Fprintln(os.Stderr, "ERROR: This binary was built with 'go build' directly.")
+		fmt.Fprintln(os.Stderr, "       macOS will SIGKILL unsigned binaries. Use 'make build' instead.")
 		if gtRoot := os.Getenv("GT_ROOT"); gtRoot != "" {
-			fmt.Fprintf(os.Stderr, "         Run from: %s\n", gtRoot)
+			fmt.Fprintf(os.Stderr, "       Run from: %s\n", gtRoot)
 		}
+		os.Exit(1)
 	}
 
 	// Initialize CLI theme (dark/light mode support)
 	initCLITheme()
+
+	// gt done can autosave and push; prove ownership before shared pre-run writes.
+	if isDoneCommand(cmd) {
+		if _, err := resolveDonePolecatWorktree(); err != nil {
+			return err
+		}
+	}
 
 	// Log command usage telemetry (fire-and-forget, excludes tap/signal)
 	logCommandUsage(cmd, args)
@@ -118,16 +135,16 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Get the root command name being run
-	cmdName := cmd.Name()
+	beadsExempt := isCommandOrAncestorExempt(cmd, beadsExemptCommands)
+	branchExempt := isCommandOrAncestorExempt(cmd, branchCheckExemptCommands)
 
 	// Check for stale binary (warning only, doesn't block)
-	if !beadsExemptCommands[cmdName] {
+	if !beadsExempt {
 		checkStaleBinaryWarning()
 	}
 
 	// Check town root branch (warning only, non-blocking)
-	if !branchCheckExemptCommands[cmdName] {
+	if !branchExempt {
 		warnIfTownRootOffMain()
 	}
 
@@ -138,7 +155,7 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	touchPolecatHeartbeat()
 
 	// Skip beads check for exempt commands
-	if beadsExemptCommands[cmdName] || isRoleCommand(cmd) {
+	if beadsExempt || isRoleCommand(cmd) {
 		return nil
 	}
 
@@ -151,12 +168,30 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func isCommandOrAncestorExempt(cmd *cobra.Command, exemptions map[string]bool) bool {
+	for c := cmd; c != nil; c = c.Parent() {
+		if exemptions[c.Name()] {
+			return true
+		}
+	}
+	return false
+}
+
 // isRoleCommand returns true when the invoked command belongs to the `gt role` tree.
 // Role introspection commands are often used in scripts and tests that expect clean
 // output; beads version warnings are unrelated noise for these commands.
 func isRoleCommand(cmd *cobra.Command) bool {
 	for c := cmd; c != nil; c = c.Parent() {
 		if c.Name() == "role" {
+			return true
+		}
+	}
+	return false
+}
+
+func isDoneCommand(cmd *cobra.Command) bool {
+	for c := cmd; c != nil; c = c.Parent() {
+		if c.Name() == "done" {
 			return true
 		}
 	}
@@ -231,7 +266,7 @@ func warnIfTownRootOffMain() {
 	}
 
 	branch := strings.TrimSpace(string(out))
-	if branch == "" || branch == "main" || branch == "master" {
+	if branch == "" || branch == "main" || branch == "master" || branch == "gt_managed" {
 		return
 	}
 
@@ -270,34 +305,35 @@ func checkStaleBinaryWarning() {
 		staleBinaryWarned = true
 		_ = os.Setenv("GT_STALE_WARNED", "1")
 
-		msg := fmt.Sprintf("gt binary is stale (built from %s, repo at %s)",
-			version.ShortCommit(info.BinaryCommit), version.ShortCommit(info.RepoCommit))
-		if info.CommitsBehind > 0 {
-			msg = fmt.Sprintf("gt binary is %d commits behind (built from %s, repo at %s)",
-				info.CommitsBehind, version.ShortCommit(info.BinaryCommit), version.ShortCommit(info.RepoCommit))
-		}
+		msg := info.Describe("gt binary")
 		fmt.Fprintf(os.Stderr, "%s %s\n", style.WarningPrefix, msg)
-		fmt.Fprintf(os.Stderr, "    %s Run 'make install' in gastown repo to update\n", style.ArrowPrefix)
+		if info.IsForward && info.OnMainBranch {
+			fmt.Fprintf(os.Stderr, "    %s Run 'make install' in gastown repo to update\n", style.ArrowPrefix)
+		} else {
+			fmt.Fprintf(os.Stderr, "    %s Run 'gt stale' for details; switch to a build branch before rebuilding\n", style.ArrowPrefix)
+		}
 	}
 }
 
 // Execute runs the root command and returns an exit code.
 // The caller (main) should call os.Exit with this code.
 func Execute() int {
-	ctx := context.Background()
-	provider, err := telemetry.Init(ctx, "gastown", Version)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: telemetry init: %v\n", err)
-	}
-	if provider != nil {
-		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			_ = provider.Shutdown(shutdownCtx)
-		}()
-		// Set OTEL_RESOURCE_ATTRIBUTES in the process env so all bd subprocesses
-		// spawned via exec.Command inherit GT context automatically.
-		telemetry.SetProcessOTELAttrs()
+	if !isDoneInvocation(os.Args[1:]) {
+		ctx := context.Background()
+		provider, err := telemetry.Init(ctx, "gastown", Version)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: telemetry init: %v\n", err)
+		}
+		if provider != nil {
+			defer func() {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_ = provider.Shutdown(shutdownCtx)
+			}()
+			// Set OTEL_RESOURCE_ATTRIBUTES in the process env so all bd subprocesses
+			// spawned via exec.Command inherit GT context automatically.
+			telemetry.SetProcessOTELAttrs()
+		}
 	}
 
 	if err := rootCmd.Execute(); err != nil {
@@ -309,6 +345,11 @@ func Execute() int {
 		return 1
 	}
 	return 0
+}
+
+func isDoneInvocation(args []string) bool {
+	cmd, _, err := rootCmd.Find(args)
+	return err == nil && isDoneCommand(cmd)
 }
 
 // Command group IDs - used by subcommands to organize help output

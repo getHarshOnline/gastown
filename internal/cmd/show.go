@@ -3,9 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
-	"syscall"
 
 	"github.com/spf13/cobra"
 )
@@ -47,57 +45,88 @@ func runShow(cmd *cobra.Command, args []string) error {
 	return execBdShow(args)
 }
 
-// execBdShow replaces the current process with 'bd show'.
-// Resolves the correct rig directory from the bead's prefix via routes.jsonl
-// so that rig-prefixed beads (e.g., myproject-abc) are found in their rig
-// database rather than only the town-level hq database. (GH#2126)
-func execBdShow(args []string) error {
-	bdPath, err := exec.LookPath("bd")
-	if err != nil {
-		return fmt.Errorf("bd not found in PATH: %w", err)
-	}
-
-	// Resolve the rig directory for the bead's prefix so bd runs from the
-	// correct working directory. Without this, bd may query the wrong database
-	// when inherited BEADS_DIR is set or when bd's routing doesn't handle
-	// cross-rig lookups from the town root.
-	if beadID := extractBeadIDFromArgs(args); beadID != "" {
-		if dir := resolveBeadDir(beadID); dir != "" && dir != "." {
-			_ = os.Chdir(dir)
-		}
-	}
-
-	// Strip BEADS_DIR from the environment so bd discovers the database from
-	// its working directory rather than using an inherited value that may point
-	// to the wrong (e.g., town-level) database.
-	env := stripEnvKey(os.Environ(), "BEADS_DIR")
-
-	// Build args: bd show <all-args>
-	// argv[0] must be the program name for exec
-	fullArgs := append([]string{"bd", "show"}, args...)
-
-	return syscall.Exec(bdPath, fullArgs, env)
-}
-
-// extractBeadIDFromArgs returns the first non-flag argument, which is the bead ID.
-// Returns empty string if no non-flag argument is found.
+// extractBeadIDFromArgs returns the first positional bead ID, falling back to
+// bd show's --id form for IDs that look like flags. bd show processes positional
+// IDs before --id values even when --id appears earlier in argv.
 func extractBeadIDFromArgs(args []string) string {
-	for _, arg := range args {
+	idFlag := ""
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+			break
+		}
+		if strings.HasPrefix(arg, "--id=") {
+			if idFlag == "" {
+				idFlag = strings.TrimPrefix(arg, "--id=")
+			}
+			continue
+		}
+		if arg == "--id" {
+			if i+1 < len(args) {
+				if idFlag == "" {
+					idFlag = args[i+1]
+				}
+				i++
+			}
+			continue
+		}
+		if showFlagConsumesNextArg(arg) {
+			i++
+			continue
+		}
 		if !strings.HasPrefix(arg, "-") {
 			return arg
 		}
 	}
-	return ""
+	return idFlag
 }
 
-// stripEnvKey removes all entries matching the given key from an environment slice.
-func stripEnvKey(env []string, key string) []string {
-	prefix := key + "="
-	result := make([]string, 0, len(env))
-	for _, e := range env {
-		if !strings.HasPrefix(e, prefix) {
-			result = append(result, e)
+func showFlagConsumesNextArg(arg string) bool {
+	switch arg {
+	case "--as-of", "--actor", "--db", "--directory", "--dolt-auto-commit", "--format", "-C":
+		return true
+	default:
+		return false
+	}
+}
+
+type bdShowInvocation struct {
+	Dir         string
+	Env         []string
+	ExecArgs    []string
+	CommandArgs []string
+}
+
+func newBdShowInvocation(args []string, environ []string) bdShowInvocation {
+	dir := ""
+	if beadID := extractBeadIDFromArgs(args); beadID != "" {
+		if resolved := resolveBeadDir(beadID); resolved != "" && resolved != "." {
+			dir = resolved
 		}
 	}
-	return result
+
+	bdc := &bdCmd{
+		args:   append([]string{"show"}, args...),
+		env:    environ,
+		stderr: os.Stderr,
+	}
+	if dir != "" {
+		bdc.Dir(dir)
+	}
+	cmd := bdc.Build()
+	commandArgs := append([]string(nil), cmd.Args[1:]...)
+
+	return bdShowInvocation{
+		Dir:         cmd.Dir,
+		Env:         cmd.Env,
+		ExecArgs:    cmd.Args,
+		CommandArgs: commandArgs,
+	}
+}
+
+func currentBdShowInvocation(args []string) bdShowInvocation {
+	return newBdShowInvocation(args, os.Environ())
 }

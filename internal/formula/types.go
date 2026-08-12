@@ -31,19 +31,20 @@ type Formula struct {
 	Description string      `toml:"description"`
 	Type        FormulaType `toml:"type"`
 	Version     int         `toml:"version"`
-	Pour        bool        `toml:"pour"` // If true, steps are materialized as sub-wisps with checkpoint recovery. Default false (inline/root-only).
-	Agent       string      `toml:"agent"` // Default agent for all legs (GH#2118)
+	Pour        bool        `toml:"pour"`        // If true, steps are materialized as sub-wisps with checkpoint recovery. Default false (inline/root-only).
+	Agent       string      `toml:"agent"`       // Default agent for all legs (GH#2118)
+	ReviewOnly  bool        `toml:"review_only"` // If true, all legs are analysis-only — no code commits expected (gt-kvf)
 
 	// Convoy-specific
-	Inputs    map[string]Input `toml:"inputs"`
+	Inputs    map[string]Input  `toml:"inputs"`
 	Prompts   map[string]string `toml:"prompts"`
 	Output    *Output           `toml:"output"`
 	Legs      []Leg             `toml:"legs"`
 	Synthesis *Synthesis        `toml:"synthesis"`
 
 	// Workflow-specific
-	Steps []Step           `toml:"steps"`
-	Vars  map[string]Var   `toml:"vars"`
+	Steps []Step         `toml:"steps"`
+	Vars  map[string]Var `toml:"vars"`
 
 	// Composition-specific
 	Extends []string      `toml:"extends"` // Parent formula names to inherit steps from.
@@ -105,7 +106,8 @@ type Leg struct {
 	Title       string `toml:"title"`
 	Focus       string `toml:"focus"`
 	Description string `toml:"description"`
-	Agent       string `toml:"agent"` // Per-leg agent override (GH#2118)
+	Agent       string `toml:"agent"`       // Per-leg agent override (GH#2118)
+	ReviewOnly  bool   `toml:"review_only"` // If true, leg is analysis-only — no code commits expected (gt-kvf)
 }
 
 // Synthesis represents the synthesis step that combines leg outputs.
@@ -121,8 +123,10 @@ type Step struct {
 	Title       string   `toml:"title"`
 	Description string   `toml:"description"`
 	Needs       []string `toml:"needs"`
-	Parallel    bool     `toml:"parallel"`   // If true, this step can run concurrently with other parallel steps that share the same needs
-	Acceptance  string   `toml:"acceptance"` // Exit criteria for this step (used by Ralph loop mode)
+	Target      string   `toml:"target"`      // Optional gt sling target for this workflow step; defaults to the formula target rig
+	Parallel    bool     `toml:"parallel"`    // If true, this step can run concurrently with other parallel steps that share the same needs
+	Interactive bool     `toml:"interactive"` // If true, this step requires user dialog and runs in the current session instead of being dispatched to a polecat
+	Acceptance  string   `toml:"acceptance"`  // Exit criteria for this step (used by Ralph loop mode)
 }
 
 // Template represents a template step in an expansion formula.
@@ -131,6 +135,7 @@ type Template struct {
 	Title       string   `toml:"title"`
 	Description string   `toml:"description"`
 	Needs       []string `toml:"needs"`
+	Acceptance  string   `toml:"acceptance"` // Exit criteria for this expanded step (propagated to generated Step)
 }
 
 // Var represents a variable definition for formulas.

@@ -5,11 +5,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/rig"
 )
@@ -32,6 +35,35 @@ func TestAgentStartResult_Fields(t *testing.T) {
 	}
 }
 
+func TestUpStartRefinerySkipsForkRig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mock tmux script uses POSIX shell")
+	}
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(`{"upstream_url":"https://github.com/upstream/repo"}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "tmux.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + logPath + "\"\ncase \"$1\" in has-session) exit 1 ;; *) exit 0 ;; esac\n"
+	if err := os.WriteFile(filepath.Join(binDir, "tmux"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake tmux: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	result := upStartRefinery("testrig", &rig.Rig{Name: "testrig", Path: rigPath})
+	if !result.ok {
+		t.Fatalf("upStartRefinery ok = false, detail=%s", result.detail)
+	}
+	if !strings.Contains(result.detail, "fork-backed rig") {
+		t.Fatalf("detail = %q, want fork-backed skip", result.detail)
+	}
+}
+
 func TestMaxConcurrentAgentStarts_Constant(t *testing.T) {
 	// Verify the constant is set to a reasonable value
 	if maxConcurrentAgentStarts < 1 {
@@ -39,6 +71,59 @@ func TestMaxConcurrentAgentStarts_Constant(t *testing.T) {
 	}
 	if maxConcurrentAgentStarts > 100 {
 		t.Errorf("maxConcurrentAgentStarts = %d, should be <= 100 to prevent resource exhaustion", maxConcurrentAgentStarts)
+	}
+}
+
+func TestApplyConfiguredDoltEnvConfigBeatsStaleEnv(t *testing.T) {
+	townRoot := t.TempDir()
+	doltDataDir := filepath.Join(townRoot, ".dolt-data")
+	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"), []byte("listener:\n  host: 127.0.0.2\n  port: 5507\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_DOLT_IGNORE_CONFIG", "")
+	t.Setenv("GT_DOLT_HOST", "stale-host")
+	t.Setenv("GT_DOLT_PORT", "9999")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale-host")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "9999")
+	t.Setenv("BEADS_DOLT_PORT", "9999")
+
+	config.ApplyConfiguredDoltEnv(townRoot)
+
+	if got := os.Getenv("GT_DOLT_HOST"); got != "127.0.0.2" {
+		t.Fatalf("GT_DOLT_HOST = %q, want 127.0.0.2", got)
+	}
+	if got := os.Getenv("GT_DOLT_PORT"); got != "5507" {
+		t.Fatalf("GT_DOLT_PORT = %q, want 5507", got)
+	}
+	if got := os.Getenv("BEADS_DOLT_SERVER_HOST"); got != "" {
+		t.Fatalf("BEADS_DOLT_SERVER_HOST = %q, want cleared", got)
+	}
+}
+
+func TestApplyConfiguredDoltEnvClearsStaleHostWhenConfigHasNoHost(t *testing.T) {
+	townRoot := t.TempDir()
+	doltDataDir := filepath.Join(townRoot, ".dolt-data")
+	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"), []byte("listener:\n  port: 5507\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_DOLT_IGNORE_CONFIG", "")
+	t.Setenv("GT_DOLT_HOST", "stale-host")
+	t.Setenv("GT_DOLT_PORT", "9999")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale-host")
+
+	config.ApplyConfiguredDoltEnv(townRoot)
+
+	if got := os.Getenv("GT_DOLT_HOST"); got != "" {
+		t.Fatalf("GT_DOLT_HOST = %q, want cleared", got)
+	}
+	if got := os.Getenv("GT_DOLT_PORT"); got != "5507" {
+		t.Fatalf("GT_DOLT_PORT = %q, want 5507", got)
 	}
 }
 
@@ -211,6 +296,74 @@ func TestWorkerPoolLimitsConcurrency(t *testing.T) {
 // waitForDoltReady tests (gt-zou1n)
 // Verifies that gt up waits for Dolt server readiness before starting witnesses.
 // =============================================================================
+
+// =============================================================================
+// recoverOrphanedBeads tests (gas-udp)
+// Verifies that gt up detects and recovers orphaned hooked beads after crash.
+// =============================================================================
+
+func TestRecoverOrphanedBeads_NoRigs(t *testing.T) {
+	townRoot := t.TempDir()
+	services := recoverOrphanedBeads(townRoot, []string{}, make(map[string]*rig.Rig))
+	if len(services) != 0 {
+		t.Errorf("expected no services, got %d", len(services))
+	}
+}
+
+func TestRecoverOrphanedBeads_SkipsUnloadedRigs(t *testing.T) {
+	townRoot := t.TempDir()
+	// Rig "badrig" is in the list but not in prefetchedRigs — should be skipped.
+	services := recoverOrphanedBeads(townRoot, []string{"badrig"}, make(map[string]*rig.Rig))
+	if len(services) != 0 {
+		t.Errorf("expected no services for unloaded rig, got %d", len(services))
+	}
+}
+
+func TestRecoverOrphanedBeads_NoOrphansCleanRig(t *testing.T) {
+	// Set up a rig directory with no beads — should produce no services.
+	// Note: Full recovery-path tests (hooked bead + dead polecat → reset to open)
+	// require a live Dolt server and are covered by DetectOrphanedBeads tests
+	// in internal/witness/handlers_test.go. These up_test.go tests verify the
+	// integration wiring: correct rig iteration, skip logic, and service reporting.
+	townRoot := t.TempDir()
+	rigName := "testrig"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(filepath.Join(rigPath, "polecats"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{Path: rigPath}
+	prefetched := map[string]*rig.Rig{rigName: r}
+	services := recoverOrphanedBeads(townRoot, []string{rigName}, prefetched)
+	if len(services) != 0 {
+		t.Errorf("expected no services for clean rig, got %d", len(services))
+	}
+}
+
+func TestRecoverOrphanedBeads_MultipleRigsOnlyProcessesLoaded(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Set up two rigs, but only prefetch one
+	for _, name := range []string{"rig-a", "rig-b"} {
+		rigPath := filepath.Join(townRoot, name)
+		if err := os.MkdirAll(filepath.Join(rigPath, "polecats"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	prefetched := map[string]*rig.Rig{
+		"rig-a": {Path: filepath.Join(townRoot, "rig-a")},
+		// rig-b intentionally not prefetched
+	}
+	services := recoverOrphanedBeads(townRoot, []string{"rig-a", "rig-b"}, prefetched)
+	// Neither rig should have orphans (no Dolt server = no beads found),
+	// but the function should complete without error and not panic on rig-b.
+	for _, svc := range services {
+		if svc.Rig == "rig-b" {
+			t.Errorf("rig-b should have been skipped (not prefetched), but got service: %s", svc.Detail)
+		}
+	}
+}
 
 func TestWaitForDoltReady_NoServerMode(t *testing.T) {
 	// When no server mode metadata exists, waitForDoltReady should not block.

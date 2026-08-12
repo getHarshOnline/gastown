@@ -464,7 +464,7 @@ func TestComputeExpected(t *testing.T) {
 
 // TestComputeExpectedBackfillsSessionStart reproduces gt-y22: on-disk base
 // created before SessionStart was added to DefaultBase. SessionStart should
-// be backfilled from DefaultBase so settings.json files contain PATH exports.
+// be backfilled from DefaultBase so settings.json files contain startup hooks.
 func TestComputeExpectedBackfillsSessionStart(t *testing.T) {
 	tmpDir := t.TempDir()
 	setTestHome(t, tmpDir)
@@ -495,17 +495,21 @@ func TestComputeExpectedBackfillsSessionStart(t *testing.T) {
 		if len(expected.SessionStart) == 0 {
 			t.Errorf("%s: expected SessionStart to be backfilled from DefaultBase, got none", target)
 		}
-		// Verify PATH= is present (the actual doctor check)
-		hasPath := false
+		// Verify the generated hook uses a resolved gt command, not the stale
+		// export PATH= marker that causes settings to be treated as out-of-date.
+		hasPrime := false
 		for _, entry := range expected.SessionStart {
 			for _, hook := range entry.Hooks {
-				if strings.Contains(hook.Command, "PATH=") {
-					hasPath = true
+				if strings.Contains(hook.Command, "export PATH=") {
+					t.Errorf("%s: SessionStart contains stale export PATH marker: %q", target, hook.Command)
+				}
+				if strings.Contains(hook.Command, "prime --hook") {
+					hasPrime = true
 				}
 			}
 		}
-		if !hasPath {
-			t.Errorf("%s: expected PATH= in SessionStart hooks", target)
+		if !hasPrime {
+			t.Errorf("%s: expected prime --hook in SessionStart hooks", target)
 		}
 		// On-disk Stop should be preserved (not overwritten by DefaultBase)
 		if len(expected.Stop) == 0 {
@@ -608,18 +612,21 @@ func TestComputeExpectedNoBase(t *testing.T) {
 		}
 	}
 
-	// Deacon should get DefaultBase + built-in patrol-formula-guard (same as witness)
+	// Deacon should get DefaultBase + built-in patrol-formula-guard plus anti-batch guards.
 	deacon, err := ComputeExpected("deacon")
 	if err != nil {
 		t.Fatalf("ComputeExpected(deacon) failed: %v", err)
 	}
-	if len(deacon.PreToolUse) < 4 {
-		t.Errorf("expected deacon to have at least 4 PreToolUse hooks from DefaultOverrides (patrol-formula-guard), got %d", len(deacon.PreToolUse))
+	if len(deacon.PreToolUse) < 7 {
+		t.Errorf("expected deacon to have at least 7 PreToolUse hooks from DefaultOverrides (anti-batch + patrol-formula-guard), got %d", len(deacon.PreToolUse))
 	}
 	if len(deacon.SessionStart) != len(defaultBase.SessionStart) {
 		t.Error("expected deacon to inherit SessionStart from DefaultBase")
 	}
 	deaconPatrolMatchers := map[string]bool{
+		"Bash(*for *seq*)":                  false,
+		"Bash(*while true*)":                false,
+		"Bash(*while :*)":                   false,
 		"Bash(*bd mol pour*patrol*)":        false,
 		"Bash(*bd mol pour *mol-witness*)":  false,
 		"Bash(*bd mol pour *mol-deacon*)":   false,
@@ -693,8 +700,86 @@ func TestComputeExpectedWitnessRigSpecific(t *testing.T) {
 	if len(skyWitness.SessionStart) == 0 {
 		t.Error("sky/witness should inherit SessionStart from DefaultBase")
 	}
-	if len(skyWitness.UserPromptSubmit) == 0 {
-		t.Error("sky/witness should inherit UserPromptSubmit (mail-check) from DefaultBase")
+	if len(skyWitness.UserPromptSubmit) != 0 {
+		t.Error("sky/witness should disable UserPromptSubmit mail-check from DefaultBase")
+	}
+}
+
+func TestComputeExpectedPatrolRolesDisableUserPromptMailCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	for _, target := range []string{"witness", "refinery", "deacon", "boot", "sky/witness", "sky/refinery"} {
+		t.Run(target, func(t *testing.T) {
+			cfg, err := ComputeExpected(target)
+			if err != nil {
+				t.Fatalf("ComputeExpected(%s): %v", target, err)
+			}
+			if len(cfg.UserPromptSubmit) != 0 {
+				t.Fatalf("%s should disable UserPromptSubmit mail-check, got %+v", target, cfg.UserPromptSubmit)
+			}
+		})
+	}
+}
+
+func TestComputeExpectedBootBlocksRawTmuxSendKeys(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	boot, err := ComputeExpected("boot")
+	if err != nil {
+		t.Fatalf("ComputeExpected(boot): %v", err)
+	}
+
+	entry, ok := findPreToolUse(boot, "Bash(*tmux*send-keys*)")
+	if !ok {
+		t.Fatal("boot missing raw tmux send-keys guard")
+	}
+	if len(entry.Hooks) != 1 {
+		t.Fatalf("boot raw tmux guard hooks = %d, want 1", len(entry.Hooks))
+	}
+	command := entry.Hooks[0].Command
+	for _, want := range []string{
+		"BLOCKED: Boot must not use raw tmux send-keys",
+		"gt nudge --mode=immediate deacon",
+		"exit 2",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("boot raw tmux guard command missing %q: %s", want, command)
+		}
+	}
+	if len(boot.UserPromptSubmit) != 0 {
+		t.Fatalf("boot should still disable UserPromptSubmit mail-check, got %+v", boot.UserPromptSubmit)
+	}
+
+	mayor, err := ComputeExpected("mayor")
+	if err != nil {
+		t.Fatalf("ComputeExpected(mayor): %v", err)
+	}
+	if _, ok := findPreToolUse(mayor, "Bash(*tmux*send-keys*)"); ok {
+		t.Fatal("mayor must not receive Boot's raw tmux send-keys guard")
+	}
+}
+
+func findPreToolUse(cfg *HooksConfig, matcher string) (HookEntry, bool) {
+	for _, entry := range cfg.PreToolUse {
+		if entry.Matcher == matcher {
+			return entry, true
+		}
+	}
+	return HookEntry{}, false
+}
+
+func TestComputeExpectedPolecatsKeepUserPromptMailCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	cfg, err := ComputeExpected("polecats")
+	if err != nil {
+		t.Fatalf("ComputeExpected(polecats): %v", err)
+	}
+	if len(cfg.UserPromptSubmit) == 0 {
+		t.Fatal("polecats should retain UserPromptSubmit mail-check")
 	}
 }
 
@@ -881,6 +966,234 @@ func TestDiscoverTargets_RoleNames(t *testing.T) {
 		if gotRole != wantRole {
 			t.Errorf("target %q: Role = %q, want %q", key, gotRole, wantRole)
 		}
+	}
+}
+
+func TestDiscoverTargets_ReturnsOnlyClaude(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	os.MkdirAll(filepath.Join(tmpDir, "mayor"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "deacon"), 0755)
+
+	// Create a rig with crew members that have both Claude and Gemini settings.
+	// DiscoverTargets should only return Claude targets; non-Claude agents are
+	// discovered via DiscoverRoleLocations instead.
+	os.MkdirAll(filepath.Join(tmpDir, "rig1", "crew", "alice"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "rig1", "witness"), 0755)
+
+	// Install gemini settings (should NOT appear in DiscoverTargets results)
+	geminiDir := filepath.Join(tmpDir, "rig1", "crew", "alice", ".gemini")
+	os.MkdirAll(geminiDir, 0755)
+	os.WriteFile(filepath.Join(geminiDir, "settings.json"), []byte(`{"hooks":{}}`), 0644)
+
+	targets, err := DiscoverTargets(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverTargets failed: %v", err)
+	}
+
+	for _, tgt := range targets {
+		if tgt.Provider == "gemini" {
+			t.Errorf("DiscoverTargets should not return gemini targets, got: %s", tgt.DisplayKey())
+		}
+	}
+}
+
+func TestDiscoverTargets_BootIncluded(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	os.MkdirAll(filepath.Join(tmpDir, "mayor"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "deacon", "dogs", "boot"), 0755)
+
+	targets, err := DiscoverTargets(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverTargets failed: %v", err)
+	}
+
+	found := false
+	for _, tgt := range targets {
+		if tgt.Key == "boot" {
+			found = true
+			wantPath := filepath.Join(tmpDir, "deacon", "dogs", "boot", ".claude", "settings.json")
+			if tgt.Path != wantPath {
+				t.Errorf("boot target Path = %q, want %q", tgt.Path, wantPath)
+			}
+			if tgt.Role != "boot" {
+				t.Errorf("boot target Role = %q, want %q", tgt.Role, "boot")
+			}
+		}
+	}
+	if !found {
+		t.Error("expected boot target when deacon/dogs/boot/ exists, not found")
+	}
+}
+
+func TestDiscoverTargets_BootAbsent(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	os.MkdirAll(filepath.Join(tmpDir, "mayor"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "deacon"), 0755)
+	// No deacon/dogs/boot directory
+
+	targets, err := DiscoverTargets(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverTargets failed: %v", err)
+	}
+
+	for _, tgt := range targets {
+		if tgt.Key == "boot" {
+			t.Errorf("expected no boot target when deacon/dogs/boot/ absent, got one: %+v", tgt)
+		}
+	}
+}
+
+func TestDiscoverRoleLocations(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	os.MkdirAll(filepath.Join(tmpDir, "mayor"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "deacon"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "rig1", "crew", "alice"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "rig1", "polecats", "toast"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "rig1", "witness"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "rig1", "refinery"), 0755)
+
+	locations, err := DiscoverRoleLocations(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverRoleLocations failed: %v", err)
+	}
+
+	// Build lookup by role+rig
+	type key struct{ rig, role string }
+	found := make(map[key]RoleLocation)
+	for _, loc := range locations {
+		found[key{loc.Rig, loc.Role}] = loc
+	}
+
+	expected := []struct {
+		rig, role string
+	}{
+		{"", "mayor"},
+		{"", "deacon"},
+		{"rig1", "crew"},
+		{"rig1", "polecat"},
+		{"rig1", "witness"},
+		{"rig1", "refinery"},
+	}
+
+	for _, e := range expected {
+		loc, ok := found[key{e.rig, e.role}]
+		if !ok {
+			t.Errorf("expected location rig=%q role=%q not found", e.rig, e.role)
+			continue
+		}
+		if loc.Dir == "" {
+			t.Errorf("location rig=%q role=%q has empty Dir", e.rig, e.role)
+		}
+	}
+
+	if len(locations) != len(expected) {
+		t.Errorf("expected %d locations, got %d", len(expected), len(locations))
+	}
+}
+
+func TestDiscoverRoleLocations_SkipsNonRigs(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create a directory that isn't a rig (no crew/witness/polecats/refinery subdirs)
+	os.MkdirAll(filepath.Join(tmpDir, "notarig", "something"), 0755)
+	// Hidden dirs should be skipped
+	os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, ".hidden", "crew"), 0755)
+
+	locations, err := DiscoverRoleLocations(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverRoleLocations failed: %v", err)
+	}
+
+	for _, loc := range locations {
+		if loc.Rig == "notarig" || loc.Rig == ".beads" || loc.Rig == ".hidden" {
+			t.Errorf("unexpected location found: rig=%q role=%q", loc.Rig, loc.Role)
+		}
+	}
+}
+
+func TestDiscoverWorktrees(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create worktree subdirectories
+	os.MkdirAll(filepath.Join(tmpDir, "alice"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "bob"), 0755)
+	// Hidden dirs should be skipped
+	os.MkdirAll(filepath.Join(tmpDir, ".claude"), 0755)
+	// Files should be skipped
+	os.WriteFile(filepath.Join(tmpDir, "state.json"), []byte("{}"), 0644)
+
+	dirs := DiscoverWorktrees(tmpDir)
+
+	if len(dirs) != 2 {
+		t.Errorf("expected 2 worktrees, got %d: %v", len(dirs), dirs)
+	}
+
+	names := make(map[string]bool)
+	for _, d := range dirs {
+		names[filepath.Base(d)] = true
+	}
+	if !names["alice"] || !names["bob"] {
+		t.Errorf("expected alice and bob, got %v", names)
+	}
+	if names[".claude"] {
+		t.Error("hidden directory should be skipped")
+	}
+}
+
+func TestDiscoverWorktrees_EmptyDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	dirs := DiscoverWorktrees(tmpDir)
+	if len(dirs) != 0 {
+		t.Errorf("expected 0 worktrees, got %d", len(dirs))
+	}
+}
+
+func TestDiscoverWorktrees_PrefersNestedGitWorktreeRoots(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	worktree := filepath.Join(tmpDir, "fury", "gastown")
+	if err := os.MkdirAll(filepath.Join(worktree, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "dust"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	dirs := DiscoverWorktrees(tmpDir)
+
+	if len(dirs) != 2 {
+		t.Fatalf("expected 2 worktrees, got %d: %v", len(dirs), dirs)
+	}
+
+	got := make(map[string]bool)
+	for _, dir := range dirs {
+		got[dir] = true
+	}
+
+	if !got[worktree] {
+		t.Fatalf("expected nested worktree root %q, got %v", worktree, dirs)
+	}
+	if !got[filepath.Join(tmpDir, "dust")] {
+		t.Fatalf("expected direct worktree fallback %q, got %v", filepath.Join(tmpDir, "dust"), dirs)
+	}
+}
+
+func TestDiscoverWorktrees_InvalidDir(t *testing.T) {
+	dirs := DiscoverWorktrees("/nonexistent/path/that/does/not/exist")
+	if dirs != nil {
+		t.Errorf("expected nil for invalid dir, got %v", dirs)
+	}
+}
+
+func TestDiscoverRoleLocations_ReadError(t *testing.T) {
+	_, err := DiscoverRoleLocations("/nonexistent/path/that/does/not/exist")
+	if err == nil {
+		t.Error("expected error for nonexistent directory")
 	}
 }
 

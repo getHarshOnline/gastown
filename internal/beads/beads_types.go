@@ -15,6 +15,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // typesSentinel is a marker file indicating custom types have been configured.
@@ -33,17 +34,21 @@ var (
 
 // FindTownRoot walks up from startDir to find the Gas Town root directory.
 // The town root is identified by the presence of mayor/town.json.
+// Returns the outermost town root found, so that rig repos which were
+// originally standalone towns (and still contain mayor/town.json) don't
+// shadow the real town root above them.
 // Returns empty string if not found (reached filesystem root).
 func FindTownRoot(startDir string) string {
 	dir := startDir
+	candidate := ""
 	for {
 		townFile := filepath.Join(dir, "mayor", "town.json")
 		if _, err := os.Stat(townFile); err == nil {
-			return dir
+			candidate = dir
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "" // Reached filesystem root
+			return candidate // Reached filesystem root — return outermost found
 		}
 		dir = parent
 	}
@@ -87,9 +92,9 @@ func ResolveRoutingTarget(townRoot, beadID, fallbackDir string) string {
 //   - In-memory cache for multiple creates in the same CLI invocation
 //   - Sentinel file on disk for persistence across CLI invocations
 //
-// The sentinel file stores the configured types list. When the types list changes
-// (e.g., new types added in a gastown upgrade), the sentinel is detected as stale
-// and types are re-configured automatically (gt-zmy, gt-26f).
+// The sentinel file stores the configured custom and infra type lists. When
+// either list changes, the sentinel is detected as stale and types are
+// re-configured automatically (gt-zmy, gt-26f).
 //
 // This function is thread-safe and idempotent.
 //
@@ -100,7 +105,9 @@ func EnsureCustomTypes(beadsDir string) error {
 		return fmt.Errorf("empty beads directory")
 	}
 
-	typesList := strings.Join(constants.BeadsCustomTypesList(), ",")
+	customTypes := strings.Join(constants.BeadsCustomTypesList(), ",")
+	infraTypes := strings.Join(constants.BeadsInfraTypesList(), ",")
+	sentinelValue := TypeConfigSentinelValue()
 
 	ensuredMu.Lock()
 	defer ensuredMu.Unlock()
@@ -111,12 +118,12 @@ func EnsureCustomTypes(beadsDir string) error {
 	}
 
 	// Fast path: sentinel file matches current types list (previous CLI invocation).
-	// The sentinel stores the types that were configured. If types have changed
-	// (e.g., "queue" and "event" added), the sentinel won't match and we'll
-	// re-configure. Legacy "v1\n" sentinels also won't match.
+	// The sentinel stores the type configuration that was applied. If types have
+	// changed, the sentinel won't match and we'll re-configure. Legacy "v1\n" and
+	// custom-types-only sentinels also won't match.
 	sentinelPath := filepath.Join(beadsDir, typesSentinel)
 	if data, err := os.ReadFile(sentinelPath); err == nil {
-		if strings.TrimSpace(string(data)) == typesList {
+		if strings.TrimSpace(string(data)) == sentinelValue {
 			ensuredDirs[beadsDir] = true
 			return nil
 		}
@@ -133,16 +140,14 @@ func EnsureCustomTypes(beadsDir string) error {
 		return fmt.Errorf("ensure database initialized: %w", err)
 	}
 
-	// Configure custom types via bd CLI
-	bdEnv := append(stripEnvPrefixes(os.Environ(), "BEADS_DIR="), "BEADS_DIR="+beadsDir)
-	cmd := exec.Command("bd", "config", "set", "types.custom", typesList)
-	cmd.Dir = beadsDir
-	// Set BEADS_DIR explicitly to ensure bd operates on the correct database.
-	// Strip inherited BEADS_DIR first — getenv() returns the first match (gt-uygpe).
-	cmd.Env = bdEnv
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("configure custom types in %s: %s: %w",
-			beadsDir, strings.TrimSpace(string(output)), err)
+	// Configure custom and infra types via bd CLI. Rig is a durable custom type,
+	// not an infra/wisp type.
+	bdEnv := BuildMutationPinnedBDEnv(os.Environ(), beadsDir)
+	if err := setBDConfig(beadsDir, bdEnv, "types.custom", customTypes); err != nil {
+		return err
+	}
+	if err := setBDConfig(beadsDir, bdEnv, "types.infra", infraTypes); err != nil {
+		return err
 	}
 
 	// Verify the config was actually persisted in the database (GH#2637).
@@ -150,20 +155,77 @@ func EnsureCustomTypes(beadsDir string) error {
 	// database (redirect mismatch, stale metadata, server not running).
 	// Without this check, the sentinel file below would cache a lie,
 	// causing all future EnsureCustomTypes calls to skip re-configuration.
-	verifyCmd := exec.Command("bd", "config", "get", "types.custom")
-	verifyCmd.Dir = beadsDir
-	verifyCmd.Env = bdEnv
-	if verifyOutput, err := verifyCmd.Output(); err != nil || !strings.Contains(string(verifyOutput), "agent") {
-		return fmt.Errorf("types.custom not persisted in %s after bd config set (verify returned %q): db may be misconfigured",
-			beadsDir, strings.TrimSpace(string(verifyOutput)))
+	if err := verifyBDConfig(beadsDir, bdEnv, "types.custom", customTypes); err != nil {
+		return err
+	}
+	if err := verifyBDConfig(beadsDir, bdEnv, "types.infra", infraTypes); err != nil {
+		return err
 	}
 
-	// Write sentinel file with the types list for staleness detection.
-	// On next invocation, if types have changed, the sentinel won't match
-	// and we'll re-configure automatically.
-	_ = os.WriteFile(sentinelPath, []byte(typesList+"\n"), 0644)
+	// Write sentinel file with the type config for staleness detection. On next
+	// invocation, if types have changed, the sentinel won't match and we'll
+	// re-configure automatically.
+	_ = os.WriteFile(sentinelPath, []byte(sentinelValue+"\n"), 0644)
 
 	ensuredDirs[beadsDir] = true
+	return nil
+}
+
+// TypeConfigSentinelValue returns the current type configuration fingerprint.
+// Tests in other packages use this to avoid duplicating the sentinel format.
+func TypeConfigSentinelValue() string {
+	return fmt.Sprintf("types.custom=%s\ntypes.infra=%s",
+		strings.Join(constants.BeadsCustomTypesList(), ","),
+		strings.Join(constants.BeadsInfraTypesList(), ","))
+}
+
+func setBDConfig(beadsDir string, env []string, key, value string) error {
+	cmd := exec.Command("bd", "config", "set", key, value)
+	cmd.Dir = beadsDir
+	util.SetDetachedProcessGroup(cmd)
+	// Set BEADS_DIR and BEADS_DOLT_SERVER_DATABASE explicitly to ensure bd
+	// operates on the correct database. Strip inherited values first — getenv()
+	// returns the first match (gt-uygpe).
+	cmd.Env = env
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("configure %s in %s: %s: %w", key, beadsDir, strings.TrimSpace(string(output)), err)
+	}
+	return nil
+}
+
+func verifyBDConfig(beadsDir string, env []string, key, want string) error {
+	cmd := exec.Command("bd", "config", "get", key)
+	cmd.Dir = beadsDir
+	cmd.Env = env
+	util.SetDetachedProcessGroup(cmd)
+	output, err := cmd.Output()
+	got := ParseConfigOutput(output)
+	if err != nil || got != want {
+		return fmt.Errorf("%s not persisted in %s after bd config set (verify returned %q): db may be misconfigured", key, beadsDir, got)
+	}
+	return nil
+}
+
+// EnsureCustomTypesConfigYAML records Gas Town custom types directly in
+// config.yaml. Fresh install uses this before invoking any bd config command so
+// older cached bd binaries do not initialize legacy views against the new schema.
+func EnsureCustomTypesConfigYAML(beadsDir string) error {
+	if beadsDir == "" {
+		return fmt.Errorf("empty beads directory")
+	}
+	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+		return fmt.Errorf("beads directory does not exist: %s", beadsDir)
+	}
+
+	customTypes := strings.Join(constants.BeadsCustomTypesList(), ",")
+	infraTypes := strings.Join(constants.BeadsInfraTypesList(), ",")
+
+	if err := EnsureConfigYAMLValue(beadsDir, "types.custom", customTypes); err != nil {
+		return err
+	}
+	if err := EnsureConfigYAMLValue(beadsDir, "types.infra", infraTypes); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -213,12 +275,14 @@ func EnsureCustomStatuses(beadsDir string) error {
 	// Read current custom statuses and merge with required ones
 	getCmd := exec.Command("bd", "config", "get", "status.custom")
 	getCmd.Dir = beadsDir
-	getCmd.Env = append(stripEnvPrefixes(os.Environ(), "BEADS_DIR="), "BEADS_DIR="+beadsDir)
+	util.SetDetachedProcessGroup(getCmd)
+	getEnv := BuildReadOnlyPinnedBDEnv(os.Environ(), beadsDir)
+	getCmd.Env = getEnv
 	existingOutput, _ := getCmd.Output()
 
 	// Build merged set: existing + required
 	statusSet := make(map[string]bool)
-	if existing := strings.TrimSpace(string(existingOutput)); existing != "" {
+	if existing := ParseConfigOutput(existingOutput); existing != "" {
 		for _, s := range strings.Split(existing, ",") {
 			s = strings.TrimSpace(s)
 			if s != "" {
@@ -241,7 +305,9 @@ func EnsureCustomStatuses(beadsDir string) error {
 	// Configure custom statuses via bd CLI
 	cmd := exec.Command("bd", "config", "set", "status.custom", mergedStr)
 	cmd.Dir = beadsDir
-	cmd.Env = append(stripEnvPrefixes(os.Environ(), "BEADS_DIR="), "BEADS_DIR="+beadsDir)
+	util.SetDetachedProcessGroup(cmd)
+	setEnv := BuildMutationPinnedBDEnv(os.Environ(), beadsDir)
+	cmd.Env = setEnv
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("configure custom statuses in %s: %s: %w",
 			beadsDir, strings.TrimSpace(string(output)), err)
@@ -323,7 +389,9 @@ func ensureDatabaseInitialized(beadsDir string) error {
 	initArgs = append(initArgs, "--server")
 	cmd := exec.Command("bd", initArgs...)
 	cmd.Dir = parentDir
-	cmd.Env = append(stripEnvPrefixes(os.Environ(), "BEADS_DIR="), "BEADS_DIR="+beadsDir)
+	util.SetDetachedProcessGroup(cmd)
+	initEnv := BuildMutationPinnedBDEnv(os.Environ(), beadsDir)
+	cmd.Env = initEnv
 	if output, err := cmd.CombinedOutput(); err != nil {
 		// Handle "already initialized" gracefully, matching install.go behavior.
 		// This can happen due to race conditions or if detection heuristics miss
@@ -340,7 +408,9 @@ func ensureDatabaseInitialized(beadsDir string) error {
 	if prefix != "" {
 		pfxCmd := exec.Command("bd", "config", "set", "issue_prefix", prefix)
 		pfxCmd.Dir = parentDir
-		pfxCmd.Env = append(stripEnvPrefixes(os.Environ(), "BEADS_DIR="), "BEADS_DIR="+beadsDir)
+		util.SetDetachedProcessGroup(pfxCmd)
+		pfxEnv := BuildMutationPinnedBDEnv(os.Environ(), beadsDir)
+		pfxCmd.Env = pfxEnv
 		_, _ = pfxCmd.CombinedOutput() // Best effort — crash prevention guard
 	}
 
@@ -351,10 +421,11 @@ func ensureDatabaseInitialized(beadsDir string) error {
 	// After bd init --server, the Dolt SQL server may need time to register
 	// the new database in its catalog. Retry once after a short delay if the
 	// first migrate attempt fails (GH#1769).
-	migrateEnv := append(stripEnvPrefixes(os.Environ(), "BEADS_DIR="), "BEADS_DIR="+beadsDir)
+	migrateEnv := BuildMutationPinnedBDEnv(os.Environ(), beadsDir)
 	migrateCmd := exec.Command("bd", "migrate", "--yes")
 	migrateCmd.Dir = parentDir
 	migrateCmd.Env = migrateEnv
+	util.SetDetachedProcessGroup(migrateCmd)
 	if _, err := migrateCmd.CombinedOutput(); err != nil {
 		// First attempt failed — server may not have registered the database yet.
 		// Wait briefly and retry once.
@@ -362,6 +433,7 @@ func ensureDatabaseInitialized(beadsDir string) error {
 		retryCmd := exec.Command("bd", "migrate", "--yes")
 		retryCmd.Dir = parentDir
 		retryCmd.Env = migrateEnv
+		util.SetDetachedProcessGroup(retryCmd)
 		_, _ = retryCmd.CombinedOutput() // Best effort on retry — CreateAgentBead fallback handles failure
 	}
 
@@ -442,4 +514,21 @@ func ResetEnsuredDirs() {
 	ensuredMu.Lock()
 	defer ensuredMu.Unlock()
 	ensuredDirs = make(map[string]bool)
+}
+
+// ParseConfigOutput extracts the config value from `bd config get <key>` output,
+// filtering out informational lines (`Note: ...`) and the unset sentinel
+// (`<key> (not set)`). Returns "" when no value line is present.
+//
+// Without this filter, callers that merge the parsed value back into a
+// `bd config set` would pollute the config with strings like
+// "status.custom (not set)", which fail bd's regex validation (gt-kbi).
+func ParseConfigOutput(output []byte) string {
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "Note:") && !strings.Contains(line, "(not set)") {
+			return line
+		}
+	}
+	return ""
 }

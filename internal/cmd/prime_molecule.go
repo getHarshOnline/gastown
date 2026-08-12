@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/formula"
+	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
 )
@@ -109,30 +110,19 @@ func showMoleculeExecutionPrompt(workDir, moleculeID string) {
 // showFormulaSteps renders the formula steps inline in the prime output.
 // Agents read these steps instead of materializing them as wisp rows.
 // The label parameter customizes the section header (e.g., "Patrol Steps", "Work Steps").
+// townRoot and rigName are used to load formula overlays (operator customizations).
 // extraVars is an optional list of "key=value" overrides that are substituted into
 // step descriptions before rendering, taking precedence over formula defaults.
-func showFormulaSteps(formulaName, label string, extraVars ...[]string) {
-	content, err := formula.GetEmbeddedFormulaContent(formulaName)
+func showFormulaSteps(formulaName, label, townRoot, rigName string, extraVars ...[]string) {
+	f, varMap, err := resolveFormulaForRendering(formulaName, townRoot, rigName, firstFormulaVars(extraVars))
 	if err != nil {
-		style.PrintWarning("could not load formula %s: %v", formulaName, err)
-		return
-	}
-
-	f, err := formula.Parse(content)
-	if err != nil {
-		style.PrintWarning("could not parse formula %s: %v", formulaName, err)
+		style.PrintWarning("%v", err)
 		return
 	}
 
 	if len(f.Steps) == 0 {
 		return
 	}
-
-	var vars []string
-	if len(extraVars) > 0 {
-		vars = extraVars[0]
-	}
-	varMap := buildFormulaVarMap(f, vars)
 
 	fmt.Println()
 	fmt.Printf("**%s** (%d steps from %s):\n", label, len(f.Steps), formulaName)
@@ -145,40 +135,78 @@ func showFormulaSteps(formulaName, label string, extraVars ...[]string) {
 
 // showFormulaStepsFull renders formula steps with full descriptions.
 // Used for polecat work formulas where step details are the primary instructions.
+// townRoot and rigName are used to load formula overlays (operator customizations).
 // extraVars is an optional list of "key=value" overrides substituted into step descriptions.
-func showFormulaStepsFull(formulaName string, extraVars ...[]string) {
-	content, err := formula.GetEmbeddedFormulaContent(formulaName)
+func showFormulaStepsFull(formulaName, townRoot, rigName string, extraVars ...[]string) {
+	rendered, err := renderFormulaStepsFull(formulaName, townRoot, rigName, extraVars...)
 	if err != nil {
-		style.PrintWarning("could not load formula %s: %v", formulaName, err)
+		style.PrintWarning("%v", err)
 		return
+	}
+	fmt.Print(rendered)
+}
+
+func renderFormulaStepsFull(formulaName, townRoot, rigName string, extraVars ...[]string) (string, error) {
+	f, varMap, err := resolveFormulaForRendering(formulaName, townRoot, rigName, firstFormulaVars(extraVars))
+	if err != nil {
+		return "", err
+	}
+	return renderFormulaStepsFullParsed(formulaName, f, varMap), nil
+}
+
+func renderFormulaRootAndStepsFull(formulaName, townRoot, rigName string, extraVars ...[]string) (string, error) {
+	f, varMap, err := resolveFormulaForRendering(formulaName, townRoot, rigName, firstFormulaVars(extraVars))
+	if err != nil {
+		return "", err
+	}
+
+	var sb strings.Builder
+	if desc := strings.TrimSpace(applyFormulaVars(f.Description, varMap)); desc != "" {
+		sb.WriteString(desc)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString(strings.TrimLeft(renderFormulaStepsFullParsed(formulaName, f, varMap), "\n"))
+	return strings.TrimSpace(sb.String()), nil
+}
+
+func resolveFormulaForRendering(formulaName, townRoot, rigName string, vars []string) (*formula.Formula, map[string]string, error) {
+	content, err := formula.ResolveFormulaContent(formulaName, townRoot, rigName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not load formula %s: %w", formulaName, err)
 	}
 
 	f, err := formula.Parse(content)
 	if err != nil {
-		style.PrintWarning("could not parse formula %s: %v", formulaName, err)
-		return
+		return nil, nil, fmt.Errorf("could not parse formula %s: %w", formulaName, err)
 	}
+	applyFormulaOverlays(f, formulaName, townRoot, rigName)
+	return f, buildFormulaVarMap(f, vars), nil
+}
 
+func firstFormulaVars(extraVars [][]string) []string {
+	if len(extraVars) == 0 {
+		return nil
+	}
+	return extraVars[0]
+}
+
+func renderFormulaStepsFullParsed(formulaName string, f *formula.Formula, varMap map[string]string) string {
 	if len(f.Steps) == 0 {
-		return
+		return ""
 	}
 
-	var vars []string
-	if len(extraVars) > 0 {
-		vars = extraVars[0]
-	}
-	varMap := buildFormulaVarMap(f, vars)
-
-	fmt.Println()
-	fmt.Printf("**Formula Checklist** (%d steps from %s):\n\n", len(f.Steps), formulaName)
+	var sb strings.Builder
+	sb.WriteString("\n")
+	fmt.Fprintf(&sb, "**Formula Checklist** (%d steps from %s):\n\n", len(f.Steps), formulaName)
 	for i, step := range f.Steps {
 		title := applyFormulaVars(step.Title, varMap)
-		fmt.Printf("### Step %d: %s\n\n", i+1, title)
+		fmt.Fprintf(&sb, "### Step %d: %s\n\n", i+1, title)
 		if step.Description != "" {
-			fmt.Println(applyFormulaVars(step.Description, varMap))
-			fmt.Println()
+			sb.WriteString(applyFormulaVars(step.Description, varMap))
+			sb.WriteString("\n\n")
 		}
 	}
+	return sb.String()
 }
 
 // buildFormulaVarMap builds a map of variable name → value for substitution.
@@ -186,7 +214,7 @@ func showFormulaStepsFull(formulaName string, extraVars ...[]string) {
 func buildFormulaVarMap(f *formula.Formula, extraVars []string) map[string]string {
 	m := make(map[string]string, len(f.Vars))
 	for k, v := range f.Vars {
-		if v.Default != "" {
+		if v.Default != "" || !v.Required {
 			m[k] = v.Default
 		}
 	}
@@ -196,6 +224,38 @@ func buildFormulaVarMap(f *formula.Formula, extraVars []string) map[string]strin
 		}
 	}
 	return m
+}
+
+func attachmentFormulaVars(attachment *beads.AttachmentFields) []string {
+	if attachment == nil {
+		return nil
+	}
+	indexes := make(map[string]int)
+	vars := make([]string, 0, len(attachment.AttachedVars))
+	add := func(variable string) {
+		variable = strings.TrimSpace(variable)
+		if variable == "" {
+			return
+		}
+		idx := strings.IndexByte(variable, '=')
+		if idx <= 0 {
+			return
+		}
+		key := strings.TrimSpace(variable[:idx])
+		if idx, ok := indexes[key]; ok {
+			vars[idx] = variable
+			return
+		}
+		indexes[key] = len(vars)
+		vars = append(vars, variable)
+	}
+	for _, variable := range strings.Split(attachment.FormulaVars, "\n") {
+		add(variable)
+	}
+	for _, variable := range attachment.AttachedVars {
+		add(variable)
+	}
+	return vars
 }
 
 // applyFormulaVars replaces {{key}} placeholders in text with values from varMap.
@@ -217,6 +277,7 @@ func extractFormulaVar(formulaVars, key string) string {
 	}
 	return ""
 }
+
 // truncateDescription truncates a multi-line description to a single line summary.
 func truncateDescription(desc string, maxLen int) string {
 	// Take just the first line
@@ -263,7 +324,6 @@ func outputMoleculeContext(ctx RoleContext) {
 	// No child-based tracking needed.
 }
 
-
 // outputDeaconPatrolContext shows patrol molecule status for the Deacon.
 // Deacon uses wisps (Wisp:true issues in main .beads/) for patrol cycles.
 // Deacon is a town-level role, so it uses town root beads (not rig beads).
@@ -276,19 +336,19 @@ func outputDeaconPatrolContext(ctx RoleContext) {
 	}
 
 	cfg := PatrolConfig{
-		RoleName:        "deacon",
-		PatrolMolName:   constants.MolDeaconPatrol,
-		BeadsDir:        ctx.TownRoot, // Town-level role uses town root beads
-		Assignee:        "deacon",
-		HeaderEmoji:     "🔄",
-		HeaderTitle:     "Patrol Status (Wisp-based)",
+		RoleName:      "deacon",
+		PatrolMolName: constants.MolDeaconPatrol,
+		BeadsDir:      ctx.TownRoot, // Town-level role uses town root beads
+		Assignee:      "deacon",
+		HeaderEmoji:   "🔄",
+		HeaderTitle:   "Patrol Status (Wisp-based)",
 		WorkLoopSteps: []string{
 			"Work through each patrol step in sequence (see checklist below)",
 			"At cycle end:\n   - If context LOW:\n     * Report and loop: `" + cli.Name() + " patrol report --summary \"<brief summary of observations>\"`\n     * This closes the current patrol and starts a new cycle\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Deacon patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
 		},
 	}
 	outputPatrolContext(cfg)
-	showFormulaSteps(constants.MolDeaconPatrol, "Patrol Steps")
+	showFormulaStepsFull(constants.MolDeaconPatrol, ctx.TownRoot, ctx.Rig)
 }
 
 // outputWitnessPatrolContext shows patrol molecule status for the Witness.
@@ -298,20 +358,22 @@ func outputWitnessPatrolContext(ctx RoleContext) {
 		fmt.Printf("\n⏸️  Rig %s is %s — skipping patrol wisp generation.\n", ctx.Rig, reason)
 		return
 	}
+	extraVars := buildWitnessPatrolVars(ctx)
 	cfg := PatrolConfig{
-		RoleName:        "witness",
-		PatrolMolName:   constants.MolWitnessPatrol,
-		BeadsDir:        ctx.WorkDir,
-		Assignee:        ctx.Rig + "/witness",
-		HeaderEmoji:     constants.EmojiWitness,
-		HeaderTitle:     "Witness Patrol Status",
+		RoleName:      "witness",
+		PatrolMolName: constants.MolWitnessPatrol,
+		BeadsDir:      ctx.TownRoot,
+		Assignee:      ctx.Rig + "/witness",
+		HeaderEmoji:   constants.EmojiWitness,
+		HeaderTitle:   "Witness Patrol Status",
+		ExtraVars:     extraVars,
 		WorkLoopSteps: []string{
 			"Work through each patrol step in sequence (see checklist below)",
 			"At cycle end:\n   - If context LOW:\n     * Report and loop: `" + cli.Name() + " patrol report --summary \"<brief summary of observations>\"`\n     * This closes the current patrol and starts a new cycle\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Witness patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
 		},
 	}
 	outputPatrolContext(cfg)
-	showFormulaSteps(constants.MolWitnessPatrol, "Patrol Steps")
+	showFormulaSteps(constants.MolWitnessPatrol, "Patrol Steps", ctx.TownRoot, ctx.Rig, extraVars)
 }
 
 // outputRefineryPatrolContext shows patrol molecule status for the Refinery.
@@ -321,21 +383,42 @@ func outputRefineryPatrolContext(ctx RoleContext) {
 		fmt.Printf("\n⏸️  Rig %s is %s — skipping patrol wisp generation.\n", ctx.Rig, reason)
 		return
 	}
+	if stop, err := refinery.ActiveSafetyStop(ctx.TownRoot, ctx.Rig); err != nil {
+		style.PrintWarning("could not check refinery safety stop: %v", err)
+		return
+	} else if stop != nil {
+		fmt.Printf("\nRefinery %s is %s; skipping patrol wisp generation.\n", ctx.Rig, stop.Reason())
+		return
+	}
 	cfg := PatrolConfig{
-		RoleName:        "refinery",
-		PatrolMolName:   constants.MolRefineryPatrol,
-		BeadsDir:        ctx.WorkDir,
-		Assignee:        ctx.Rig + "/refinery",
-		HeaderEmoji:     "🔧",
-		HeaderTitle:     "Refinery Patrol Status",
-		ExtraVars:       buildRefineryPatrolVars(ctx),
+		RoleName:      "refinery",
+		PatrolMolName: constants.MolRefineryPatrol,
+		BeadsDir:      ctx.TownRoot,
+		Assignee:      ctx.Rig + "/refinery",
+		HeaderEmoji:   "🔧",
+		HeaderTitle:   "Refinery Patrol Status",
+		ExtraVars:     buildRefineryPatrolVars(ctx),
 		WorkLoopSteps: []string{
 			"Work through each patrol step in sequence (see checklist below)",
 			"At cycle end:\n   - If context LOW:\n     * Report and loop: `" + cli.Name() + " patrol report --summary \"<brief summary of observations>\"`\n     * This closes the current patrol and starts a new cycle\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Refinery patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
 		},
 	}
 	outputPatrolContext(cfg)
-	showFormulaStepsFull(constants.MolRefineryPatrol, cfg.ExtraVars)
+	showFormulaStepsFull(constants.MolRefineryPatrol, ctx.TownRoot, ctx.Rig, cfg.ExtraVars)
+}
+
+// buildWitnessPatrolVars returns --var key=value strings for the witness
+// patrol formula. Injects rig name and prefix so the formula can construct
+// agent bead IDs without hardcoding the "gt" prefix (gt-48ay).
+func buildWitnessPatrolVars(ctx RoleContext) []string {
+	var vars []string
+	if ctx.TownRoot == "" || ctx.Rig == "" {
+		return vars
+	}
+	vars = append(vars, fmt.Sprintf("rig=%s", ctx.Rig))
+	prefix := beads.GetPrefixForRig(ctx.TownRoot, ctx.Rig)
+	vars = append(vars, fmt.Sprintf("prefix=%s", prefix))
+	return vars
 }
 
 // buildRefineryPatrolVars loads rig MQ settings and returns --var key=value
@@ -357,6 +440,7 @@ func buildRefineryPatrolVars(ctx RoleContext) []string {
 	if err == nil && rigCfg != nil && rigCfg.DefaultBranch != "" {
 		defaultBranch = rigCfg.DefaultBranch
 	}
+	vars = append(vars, fmt.Sprintf("rig=%s", ctx.Rig))
 	vars = append(vars, fmt.Sprintf("target_branch=%s", defaultBranch))
 
 	// MQ-specific vars: try settings/config.json first (legacy format), then
@@ -384,6 +468,12 @@ func buildRefineryPatrolVars(ctx RoleContext) []string {
 			vars = append(vars, fmt.Sprintf("build_command=%s", mq.BuildCommand))
 		}
 		vars = append(vars, fmt.Sprintf("delete_merged_branches=%t", mq.IsDeleteMergedBranchesEnabled()))
+		vars = append(vars, fmt.Sprintf("judgment_enabled=%t", mq.IsJudgmentEnabled()))
+		vars = append(vars, fmt.Sprintf("review_depth=%s", mq.GetReviewDepth()))
+		if mq.MergeStrategy != "" {
+			vars = append(vars, fmt.Sprintf("merge_strategy=%s", mq.MergeStrategy))
+		}
+		vars = append(vars, fmt.Sprintf("require_review=%t", mq.IsRequireReviewEnabled()))
 		return vars
 	}
 
@@ -401,7 +491,7 @@ func buildRefineryPatrolVars(ctx RoleContext) []string {
 					labelMap[label[:idx]] = label[idx+1:]
 				}
 			}
-			for _, key := range []string{"integration_branch_refinery_enabled", "integration_branch_auto_land", "run_tests", "delete_merged_branches", "setup_command", "typecheck_command", "lint_command", "test_command", "build_command"} {
+			for _, key := range []string{"integration_branch_refinery_enabled", "integration_branch_auto_land", "run_tests", "delete_merged_branches", "setup_command", "typecheck_command", "lint_command", "test_command", "build_command", "merge_strategy", "require_review"} {
 				if val := labelMap[key]; val != "" {
 					vars = append(vars, fmt.Sprintf("%s=%s", key, val))
 				}
@@ -409,4 +499,32 @@ func buildRefineryPatrolVars(ctx RoleContext) []string {
 		}
 	}
 	return vars
+}
+
+// applyFormulaOverlays loads and applies overlays to a parsed formula.
+// It emits warnings for stale step IDs and, in --explain mode, shows which overlays are active.
+func applyFormulaOverlays(f *formula.Formula, formulaName, townRoot, rigName string) {
+	if townRoot == "" {
+		return
+	}
+
+	overlay, err := formula.LoadFormulaOverlay(formulaName, townRoot, rigName)
+	if err != nil {
+		style.PrintWarning("could not load overlay for %s: %v", formulaName, err)
+		return
+	}
+	if overlay == nil {
+		explain(true, fmt.Sprintf("Formula overlay: no overlay found for %s", formulaName))
+		return
+	}
+
+	explain(true, fmt.Sprintf("Formula overlay: applying %d override(s) for %s (rig=%s)", len(overlay.StepOverrides), formulaName, rigName))
+	for _, so := range overlay.StepOverrides {
+		explain(true, fmt.Sprintf("  overlay: step_id=%s mode=%s", so.StepID, so.Mode))
+	}
+
+	warnings := formula.ApplyOverlays(f, overlay)
+	for _, w := range warnings {
+		style.PrintWarning("formula overlay: %s", w)
+	}
 }

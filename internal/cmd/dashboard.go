@@ -59,6 +59,7 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 	// Check if we're in a workspace - if not, run in setup mode
 	var handler http.Handler
 	var err error
+	webCfg := config.DefaultWebTimeoutsConfig()
 
 	townRoot, wsErr := workspace.FindFromCwdOrError()
 	if wsErr != nil {
@@ -81,9 +82,10 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 		}
 
 		// Load web timeouts config (nil-safe: NewDashboardMux applies defaults)
-		var webCfg *config.WebTimeoutsConfig
 		if ts, loadErr := config.LoadOrCreateTownSettings(config.TownSettingsPath(townRoot)); loadErr == nil {
-			webCfg = ts.WebTimeouts
+			if ts.WebTimeouts != nil {
+				webCfg = ts.WebTimeouts
+			}
 		} else {
 			fmt.Fprintf(cmd.ErrOrStderr(), "warning: loading town settings: %v (using defaults)\n", loadErr)
 		}
@@ -109,6 +111,12 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 	// Open browser if requested
 	if dashboardOpen {
 		go openBrowser(url)
+	}
+
+	maxRunTimeout := config.ParseDurationOrDefault(webCfg.MaxRunTimeout, 120*time.Second)
+	writeTimeout := maxRunTimeout + 15*time.Second
+	if writeTimeout < 60*time.Second {
+		writeTimeout = 60 * time.Second
 	}
 
 	// Start the server with timeouts
@@ -147,27 +155,33 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       120 * time.Second,
 	}
 	return server.ListenAndServe()
 }
 
-// ensureDoltPortEnv sets GT_DOLT_PORT and BEADS_DOLT_PORT to the actual Dolt
-// SQL server port. This prevents bd subprocesses from inheriting a stale or
-// incorrect port (e.g., the dashboard's HTTP listen port) from the environment.
-// Reads the running port from daemon/dolt-state.json; falls back to the
-// daemon.json env config; otherwise uses the Dolt default (3307).
+// ensureDoltPortEnv sets GT_DOLT_PORT, BEADS_DOLT_SERVER_PORT,
+// BEADS_DOLT_PORT, and BEADS_DOLT_SERVER_HOST
+// to the actual Dolt server connection info. This prevents bd subprocesses from
+// inheriting stale or incorrect values from the environment.
+// Uses the same resolver as AgentEnv and doltserver.DefaultConfig.
 func ensureDoltPortEnv(townRoot string) {
-	var port int
-	if state, err := doltserver.LoadState(townRoot); err == nil && state.Port > 0 {
-		port = state.Port
-	} else {
+	port := config.ResolveDoltPort(townRoot)
+	if port <= 0 {
 		port = doltserver.DefaultPort
 	}
 	portStr := strconv.Itoa(port)
 	os.Setenv("GT_DOLT_PORT", portStr)
+	os.Setenv("BEADS_DOLT_SERVER_PORT", portStr)
 	os.Setenv("BEADS_DOLT_PORT", portStr)
+
+	if host := config.ResolveDoltHost(townRoot); host != "" {
+		os.Setenv("GT_DOLT_HOST", host)
+		os.Setenv("BEADS_DOLT_SERVER_HOST", host)
+	} else {
+		os.Unsetenv("BEADS_DOLT_SERVER_HOST")
+	}
 }
 
 // openBrowser opens the specified URL in the default browser.

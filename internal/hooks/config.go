@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/steveyegge/gastown/internal/atomicfile"
 )
 
 // HookEntry represents a single hook matcher with its associated hooks.
@@ -108,6 +110,7 @@ func MarshalSettings(s *SettingsJSON) ([]byte, error) {
 	for k, v := range s.Extra {
 		out[k] = v
 	}
+	addClaudePromptDefaults(out)
 
 	// Write known fields back into the map, or delete if zero-valued
 	if s.EditorMode != "" {
@@ -133,6 +136,70 @@ func MarshalSettings(s *SettingsJSON) ([]byte, error) {
 	return json.MarshalIndent(out, "", "  ")
 }
 
+// HasClaudePromptDefaults reports whether settings already contain the Claude
+// startup defaults Gas Town needs for non-interactive agent sessions.
+func HasClaudePromptDefaults(s *SettingsJSON) bool {
+	if s == nil {
+		return false
+	}
+	if !rawBoolEquals(s.Extra, "skipDangerousModePermissionPrompt", true) {
+		return false
+	}
+	if !rawBoolEquals(s.Extra, "hasCompletedOnboarding", true) {
+		return false
+	}
+	if _, ok := s.Extra["theme"]; !ok {
+		return false
+	}
+	permissions := map[string]json.RawMessage{}
+	if raw, ok := s.Extra["permissions"]; !ok || json.Unmarshal(raw, &permissions) != nil {
+		return false
+	}
+	return rawStringEquals(permissions, "defaultMode", "bypassPermissions")
+}
+
+func addClaudePromptDefaults(out map[string]json.RawMessage) {
+	setRaw(out, "skipDangerousModePermissionPrompt", []byte(`true`))
+	setRaw(out, "hasCompletedOnboarding", []byte(`true`))
+	setRawDefault(out, "theme", []byte(`"dark"`))
+
+	permissions := map[string]json.RawMessage{}
+	if raw, ok := out["permissions"]; ok {
+		_ = json.Unmarshal(raw, &permissions)
+	}
+	permissions["defaultMode"] = json.RawMessage(`"bypassPermissions"`)
+	if raw, err := json.Marshal(permissions); err == nil {
+		out["permissions"] = raw
+	}
+}
+
+func setRaw(out map[string]json.RawMessage, key string, value []byte) {
+	out[key] = json.RawMessage(value)
+}
+
+func setRawDefault(out map[string]json.RawMessage, key string, value []byte) {
+	if _, ok := out[key]; ok {
+		return
+	}
+	out[key] = json.RawMessage(value)
+}
+
+func rawBoolEquals(raw map[string]json.RawMessage, key string, want bool) bool {
+	var got bool
+	if value, ok := raw[key]; !ok || json.Unmarshal(value, &got) != nil {
+		return false
+	}
+	return got == want
+}
+
+func rawStringEquals(raw map[string]json.RawMessage, key, want string) bool {
+	var got string
+	if value, ok := raw[key]; !ok || json.Unmarshal(value, &got) != nil {
+		return false
+	}
+	return got == want
+}
+
 // LoadSettings reads and parses a settings.json file, preserving unknown fields.
 // Returns a zero-value SettingsJSON if the file doesn't exist.
 func LoadSettings(path string) (*SettingsJSON, error) {
@@ -153,6 +220,59 @@ func LoadSettings(path string) (*SettingsJSON, error) {
 	return settings, nil
 }
 
+// SyncManagedClaudeSettings merges computed managed hooks into a Claude
+// settings.json file while preserving non-hook settings fields.
+func SyncManagedClaudeSettings(target Target, dryRun bool) (SyncResult, error) {
+	expected, err := ComputeExpected(target.Key)
+	if err != nil {
+		return 0, fmt.Errorf("computing expected config: %w", err)
+	}
+
+	current, err := LoadSettings(target.Path)
+	if err != nil {
+		return 0, fmt.Errorf("loading current settings: %w", err)
+	}
+
+	_, statErr := os.Stat(target.Path)
+	fileExists := statErr == nil
+
+	if fileExists && HooksEqual(expected, &current.Hooks) && HasClaudePromptDefaults(current) {
+		return SyncUnchanged, nil
+	}
+
+	if dryRun {
+		if fileExists {
+			return SyncUpdated, nil
+		}
+		return SyncCreated, nil
+	}
+
+	current.Hooks = *expected
+	if current.EnabledPlugins == nil {
+		current.EnabledPlugins = make(map[string]bool)
+	}
+	current.EnabledPlugins["beads@beads-marketplace"] = false
+
+	if err := os.MkdirAll(filepath.Dir(target.Path), 0755); err != nil {
+		return 0, fmt.Errorf("creating .claude directory: %w", err)
+	}
+
+	data, err := MarshalSettings(current)
+	if err != nil {
+		return 0, fmt.Errorf("marshaling settings: %w", err)
+	}
+	data = append(data, '\n')
+
+	if err := atomicfile.WriteFile(target.Path, data, 0600); err != nil {
+		return 0, fmt.Errorf("writing settings: %w", err)
+	}
+
+	if fileExists {
+		return SyncUpdated, nil
+	}
+	return SyncCreated, nil
+}
+
 // HooksEqual returns true if two HooksConfigs are structurally equal.
 // Compares by serializing to JSON for reliable deep equality.
 func HooksEqual(a, b *HooksConfig) bool {
@@ -169,10 +289,11 @@ func HooksEqual(a, b *HooksConfig) bool {
 
 // Target represents a managed settings.json location.
 type Target struct {
-	Path string // Full path to .claude/settings.json
-	Key  string // Override key: "gastown/crew", "mayor", etc.
-	Rig  string // Rig name or empty for town-level
-	Role string // Informational only — does NOT participate in override resolution (Key does). Singular form matching RoleSettingsDir: crew, witness, refinery, polecat, mayor, deacon.
+	Path     string // Full path to .claude/settings.json or .gemini/settings.json
+	Key      string // Override key: "gastown/crew", "mayor", etc.
+	Rig      string // Rig name or empty for town-level
+	Role     string // Informational only — does NOT participate in override resolution (Key does). Singular form matching RoleSettingsDir: crew, witness, refinery, polecat, mayor, deacon.
+	Provider string // Hook provider: "claude" (default/empty) or "gemini", etc.
 }
 
 // DisplayKey returns a human-readable label for the target.
@@ -203,9 +324,25 @@ func Merge(base, override *HooksConfig) *HooksConfig {
 // context (which degrades quality), the session is replaced with a fresh one.
 // The successor picks up hooked work via SessionStart hook (gt prime --hook).
 func DefaultOverrides() map[string]*HooksConfig {
-	pathSetup := `export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH"`
-
 	return map[string]*HooksConfig{
+		// Polecats: auto-run gt done on session Stop (gas-lob).
+		// Catches the "idle polecat" problem: polecats that finish work but
+		// forget to call gt done before the session ends. The polecat-stop-check
+		// command is idempotent — it checks heartbeat state and branch commits
+		// before deciding whether to run gt done.
+		"polecats": {
+			Stop: []HookEntry{
+				{
+					Matcher: "",
+					Hooks: []Hook{
+						{
+							Type:    "command",
+							Command: gtCommand("gt tap polecat-stop-check"),
+						},
+					},
+				},
+			},
+		},
 		// Crew workers: auto-cycle session on context compaction (gt-op78).
 		// Instead of compacting (lossy), replace with fresh session that
 		// inherits hooked work. The --cycle flag does: collect state →
@@ -217,7 +354,7 @@ func DefaultOverrides() map[string]*HooksConfig {
 					Hooks: []Hook{
 						{
 							Type:    "command",
-							Command: fmt.Sprintf("%s && gt handoff --cycle --reason compaction", pathSetup),
+							Command: gtCommand("gt handoff --cycle --reason compaction"),
 						},
 					},
 				},
@@ -228,6 +365,7 @@ func DefaultOverrides() map[string]*HooksConfig {
 		// Without this, witnesses could accidentally create permanent patrol molecules
 		// that survive session restarts and accumulate unbounded.
 		"witness": {
+			UserPromptSubmit: []HookEntry{{Matcher: ""}},
 			PreToolUse: []HookEntry{
 				{
 					Matcher: "Bash(*bd mol pour*patrol*)",
@@ -259,10 +397,44 @@ func DefaultOverrides() map[string]*HooksConfig {
 				},
 			},
 		},
+		"boot": {
+			UserPromptSubmit: []HookEntry{{Matcher: ""}},
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "Bash(*tmux*send-keys*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo 'BLOCKED: Boot must not use raw tmux send-keys; it can leave unsubmitted text staged in the Deacon TUI.' && echo 'Use: gt nudge --mode=immediate deacon \"message\" (do not add --force).' && exit 2",
+					}},
+				},
+			},
+		},
 		// Deacon roles: patrol-formula-guard (same as witness).
 		// Deacons also run patrols and must use wisps, not persistent molecules.
 		"deacon": {
+			UserPromptSubmit: []HookEntry{{Matcher: ""}},
 			PreToolUse: []HookEntry{
+				{
+					Matcher: "Bash(*for *seq*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Deacon must not batch patrol cycles with for/seq loops.' && echo 'Run one patrol cycle, then use gt patrol report or gt handoff.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*while true*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Deacon must not run open-ended patrol loops.' && echo 'Run one patrol cycle, then use gt patrol report or gt handoff.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*while :*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Deacon must not run open-ended patrol loops.' && echo 'Run one patrol cycle, then use gt patrol report or gt handoff.' && exit 2",
+					}},
+				},
 				{
 					Matcher: "Bash(*bd mol pour*patrol*)",
 					Hooks: []Hook{{
@@ -296,6 +468,7 @@ func DefaultOverrides() map[string]*HooksConfig {
 		// Refinery roles: patrol-formula-guard (same as witness).
 		// Refineries also run patrols and must use wisps, not persistent molecules.
 		"refinery": {
+			UserPromptSubmit: []HookEntry{{Matcher: ""}},
 			PreToolUse: []HookEntry{
 				{
 					Matcher: "Bash(*bd mol pour*patrol*)",
@@ -398,6 +571,19 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 		Role: "deacon",
 	})
 
+	// Boot watchdog — ephemeral Claude agent in deacon/dogs/boot/.
+	// Only added when the directory exists (gitignored and optional).
+	// Adding it here ensures HooksSyncCheck manages the file and Fix() preserves
+	// custom fields (e.g. model) via the LoadSettings → MarshalSettings round-trip.
+	bootDir := filepath.Join(townRoot, "deacon", "dogs", "boot")
+	if info, err := os.Stat(bootDir); err == nil && info.IsDir() {
+		targets = append(targets, Target{
+			Path: filepath.Join(bootDir, ".claude", "settings.json"),
+			Key:  "boot",
+			Role: "boot",
+		})
+	}
+
 	// Scan rigs
 	entries, err := os.ReadDir(townRoot)
 	if err != nil {
@@ -463,9 +649,127 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 				Role: "refinery",
 			})
 		}
+
 	}
 
 	return targets, nil
+}
+
+// RoleLocation represents a discovered role directory in the workspace,
+// independent of any specific agent. Used by callers that need to resolve
+// agent configuration for each location (e.g., syncing non-Claude agents).
+type RoleLocation struct {
+	Dir  string // Absolute path to the role's parent directory (e.g., .../rig/crew)
+	Rig  string // Rig name, or empty for town-level roles
+	Role string // Role name: crew, polecat, witness, refinery, mayor, deacon
+}
+
+// DiscoverRoleLocations finds all role directories in a workspace.
+// Unlike DiscoverTargets (which returns Claude-specific paths), this returns
+// agent-agnostic directory locations that callers can use with any agent config.
+func DiscoverRoleLocations(townRoot string) ([]RoleLocation, error) {
+	var locations []RoleLocation
+
+	// Town-level roles
+	for _, role := range []string{"mayor", "deacon"} {
+		dir := filepath.Join(townRoot, role)
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			locations = append(locations, RoleLocation{Dir: dir, Role: role})
+		}
+	}
+
+	// Scan rigs
+	entries, err := os.ReadDir(townRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == "deacon" ||
+			entry.Name() == ".beads" || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+
+		rigName := entry.Name()
+		rigPath := filepath.Join(townRoot, rigName)
+
+		if !isRig(rigPath) {
+			continue
+		}
+
+		// Map subdirectories to roles
+		for _, sub := range []struct{ dir, role string }{
+			{"crew", "crew"},
+			{"polecats", "polecat"},
+			{"witness", "witness"},
+			{"refinery", "refinery"},
+		} {
+			dir := filepath.Join(rigPath, sub.dir)
+			if info, err := os.Stat(dir); err == nil && info.IsDir() {
+				locations = append(locations, RoleLocation{Dir: dir, Rig: rigName, Role: sub.role})
+			}
+		}
+	}
+
+	return locations, nil
+}
+
+// DiscoverWorktrees returns subdirectories within a role parent directory that
+// are individual worktrees (e.g., crew/alice, crew/bob, polecats/toast).
+// Skips hidden directories and non-directories.
+//
+// Some roles, especially polecats, keep the git worktree one level below the
+// agent slot directory (for example, polecats/fury/gastown). When an immediate
+// child contains nested git worktree roots, prefer those nested directories so
+// hooks are synced into the real repo root instead of the slot parent.
+func DiscoverWorktrees(roleDir string) []string {
+	entries, err := os.ReadDir(roleDir)
+	if err != nil {
+		return nil
+	}
+
+	var dirs []string
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+
+		path := filepath.Join(roleDir, entry.Name())
+		nested := nestedWorktreeRoots(path)
+		if len(nested) > 0 {
+			dirs = append(dirs, nested...)
+			continue
+		}
+
+		dirs = append(dirs, path)
+	}
+	return dirs
+}
+
+func nestedWorktreeRoots(parent string) []string {
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return nil
+	}
+
+	var dirs []string
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+
+		path := filepath.Join(parent, entry.Name())
+		if isGitWorktreeRoot(path) {
+			dirs = append(dirs, path)
+		}
+	}
+
+	return dirs
+}
+
+func isGitWorktreeRoot(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, ".git"))
+	return err == nil
 }
 
 // isRig checks if a directory looks like a rig (has crew/, witness/, or polecats/ subdirectory).
@@ -709,52 +1013,50 @@ func ValidTarget(target string) bool {
 }
 
 // DefaultBase returns a sensible default base configuration.
-// This includes PATH setup and gt prime hooks that all agents need.
+// This includes resolved gt hook commands that all agents need.
 func DefaultBase() *HooksConfig {
-	pathSetup := `export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH"`
-
 	return &HooksConfig{
 		PreToolUse: []HookEntry{
 			{
 				Matcher: "Bash(gh pr create*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: fmt.Sprintf("%s && gt tap guard pr-workflow", pathSetup),
+					Command: gtCommand("gt tap guard pr-workflow"),
 				}},
 			},
 			{
 				Matcher: "Bash(git checkout -b*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: fmt.Sprintf("%s && gt tap guard pr-workflow", pathSetup),
+					Command: gtCommand("gt tap guard pr-workflow"),
 				}},
 			},
 			{
 				Matcher: "Bash(git switch -c*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: fmt.Sprintf("%s && gt tap guard pr-workflow", pathSetup),
+					Command: gtCommand("gt tap guard pr-workflow"),
 				}},
 			},
 			{
 				Matcher: "Bash(rm -rf /*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: fmt.Sprintf("%s && gt tap guard dangerous-command", pathSetup),
+					Command: gtCommand("gt tap guard dangerous-command"),
 				}},
 			},
 			{
 				Matcher: "Bash(git push --force*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: fmt.Sprintf("%s && gt tap guard dangerous-command", pathSetup),
+					Command: gtCommand("gt tap guard dangerous-command"),
 				}},
 			},
 			{
 				Matcher: "Bash(git push -f*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: fmt.Sprintf("%s && gt tap guard dangerous-command", pathSetup),
+					Command: gtCommand("gt tap guard dangerous-command"),
 				}},
 			},
 		},
@@ -764,7 +1066,7 @@ func DefaultBase() *HooksConfig {
 				Hooks: []Hook{
 					{
 						Type:    "command",
-						Command: fmt.Sprintf("%s && gt prime --hook", pathSetup),
+						Command: gtCommand("gt prime --hook"),
 					},
 				},
 			},
@@ -775,7 +1077,7 @@ func DefaultBase() *HooksConfig {
 				Hooks: []Hook{
 					{
 						Type:    "command",
-						Command: fmt.Sprintf("%s && gt prime --hook", pathSetup),
+						Command: gtCommand("gt prime --hook"),
 					},
 				},
 			},
@@ -786,7 +1088,7 @@ func DefaultBase() *HooksConfig {
 				Hooks: []Hook{
 					{
 						Type:    "command",
-						Command: fmt.Sprintf("%s && gt mail check --inject", pathSetup),
+						Command: gtCommand("gt mail check --inject"),
 					},
 				},
 			},
@@ -797,7 +1099,7 @@ func DefaultBase() *HooksConfig {
 				Hooks: []Hook{
 					{
 						Type:    "command",
-						Command: fmt.Sprintf("%s && gt costs record &", pathSetup),
+						Command: gtCommand("gt costs record &"),
 					},
 				},
 			},
@@ -873,4 +1175,14 @@ func saveConfig(path string, cfg *HooksConfig) error {
 	}
 
 	return nil
+}
+
+func gtCommand(command string) string {
+	if command == "gt" {
+		return resolveGTBinary()
+	}
+	if strings.HasPrefix(command, "gt ") {
+		return resolveGTBinary() + command[len("gt"):]
+	}
+	return command
 }

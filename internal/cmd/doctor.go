@@ -34,6 +34,7 @@ Workspace checks:
   - rigs-registry-exists     Check mayor/rigs.json exists (fixable)
   - rigs-registry-valid      Check registered rigs exist (fixable)
   - mayor-exists             Check mayor/ directory structure
+  - disk-space               Check filesystem has sufficient free space
 
 Town root protection:
   - town-git                 Verify town root is under version control
@@ -50,6 +51,7 @@ Infrastructure checks:
 
 Cleanup checks (fixable):
   - orphan-sessions          Detect orphaned tmux sessions
+  - stalled-polecats         Detect polecats with dead sessions and unpushed work (fixable)
   - orphan-processes         Detect orphaned Claude processes
   - session-name-format      Detect sessions with outdated naming format (fixable)
   - wisp-gc                  Detect and clean abandoned wisps (>1h)
@@ -87,6 +89,9 @@ Routing checks (fixable):
 
 Lifecycle checks (fixable):
   - lifecycle-defaults          Ensure daemon.json has all lifecycle patrol entries (fixable)
+
+Formula overlay checks (fixable):
+  - overlay-health           Check formula overlay step IDs are valid (fixable)
 
 Migration checks:
   - town-claude-md           Check town-root CLAUDE.md matches embedded version (fixable)
@@ -144,13 +149,50 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		NoStart:         doctorNoStart,
 	}
 
-	// Create doctor and register checks
+	d := newDoctorForCommand(doctorRig)
+
+	// Parse slow threshold (0 = disabled)
+	var slowThreshold time.Duration
+	if doctorSlow != "" {
+		var err error
+		slowThreshold, err = time.ParseDuration(doctorSlow)
+		if err != nil {
+			return fmt.Errorf("invalid --slow duration %q: %w", doctorSlow, err)
+		}
+	}
+
+	// Run checks with streaming output
+	fmt.Println() // Initial blank line
+	var report *doctor.Report
+	if doctorFix {
+		report = d.FixStreaming(ctx, os.Stdout, slowThreshold)
+	} else {
+		report = d.RunStreaming(ctx, os.Stdout, slowThreshold)
+	}
+
+	// Print summary (checks were already printed during streaming)
+	report.PrintSummaryOnly(os.Stdout, doctorVerbose, slowThreshold)
+
+	// Exit with error code if there are errors
+	if report.HasErrors() {
+		return fmt.Errorf("doctor found %d error(s)", report.Summary.Errors)
+	}
+
+	return nil
+}
+
+func newDoctorForCommand(rig string) *doctor.Doctor {
 	d := doctor.NewDoctor()
 
 	// Register workspace-level checks first (fundamental)
 	d.RegisterAll(doctor.WorkspaceChecks()...)
 
 	d.Register(doctor.NewGlobalStateCheck())
+
+	// Disk space check — most fundamental resource check. Low disk space is the
+	// root cause of cascading failures (Dolt data loss, polecat death, lost commits).
+	// Must run before infrastructure checks that might fail confusingly on full disks.
+	d.Register(doctor.NewDiskSpaceCheck())
 
 	// Infrastructure prerequisites — these must pass before any check that
 	// shells out to bd/dolt or queries the database. Order matters:
@@ -161,6 +203,8 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewStaleBinaryCheck())
 	d.Register(doctor.NewBeadsBinaryCheck())
 	d.Register(doctor.NewDoltBinaryCheck())
+	d.Register(doctor.NewClaudeBinaryCheck())
+	d.Register(doctor.NewGroqCompoundCheck())
 	d.Register(doctor.NewDoltServerReachableCheck())
 
 	d.Register(doctor.NewTownGitCheck())
@@ -179,10 +223,12 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewCustomTypesCheck())
 	d.Register(doctor.NewCustomStatusesCheck())
 	d.Register(doctor.NewFormulaCheck())
+	d.Register(doctor.NewOverlayHealthCheck())
 	d.Register(doctor.NewPrefixConflictCheck())
 	d.Register(doctor.NewRigNameMismatchCheck())
-	d.Register(doctor.NewRigConfigSyncCheck()) // Check all registered rigs have config.json
-	d.Register(doctor.NewStaleDoltPortCheck()) // Check for stale Dolt port files
+	d.Register(doctor.NewRigConfigSyncCheck())      // Check all registered rigs have config.json
+	d.Register(doctor.NewStaleDoltPortCheck())      // Check for stale Dolt port files
+	d.Register(doctor.NewStaleSQLServerInfoCheck()) // Check for stale sql-server.info files (GH#2770)
 	d.Register(doctor.NewPrefixMismatchCheck())
 	d.Register(doctor.NewDatabasePrefixCheck())
 	d.Register(doctor.NewIdleTimeoutCheck()) // Verify dolt.idle-timeout: "0" for all rigs
@@ -192,6 +238,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewMalformedSessionNameCheck())
 	d.Register(doctor.NewOrphanSessionCheck())
 	d.Register(doctor.NewZombieSessionCheck())
+	d.Register(doctor.NewStalledPolecatCheck())
 	d.Register(doctor.NewOrphanProcessCheck())
 	d.Register(doctor.NewWispGCCheck())
 	d.Register(doctor.NewCheckMisclassifiedWisps())
@@ -258,6 +305,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	// Hooks sync check
 	d.Register(doctor.NewStaleTaskDispatchCheck())
 	d.Register(doctor.NewHooksSyncCheck())
+	d.Register(doctor.NewHooksBaseCheck())
 
 	// Dolt data health checks (binary + server reachability moved to top as prerequisites)
 	d.Register(doctor.NewDoltMetadataCheck())
@@ -269,36 +317,9 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewWorktreeGitdirCheck())
 
 	// Rig-specific checks (only when --rig is specified)
-	if doctorRig != "" {
+	if rig != "" {
 		d.RegisterAll(doctor.RigChecks()...)
 	}
 
-	// Parse slow threshold (0 = disabled)
-	var slowThreshold time.Duration
-	if doctorSlow != "" {
-		var err error
-		slowThreshold, err = time.ParseDuration(doctorSlow)
-		if err != nil {
-			return fmt.Errorf("invalid --slow duration %q: %w", doctorSlow, err)
-		}
-	}
-
-	// Run checks with streaming output
-	fmt.Println() // Initial blank line
-	var report *doctor.Report
-	if doctorFix {
-		report = d.FixStreaming(ctx, os.Stdout, slowThreshold)
-	} else {
-		report = d.RunStreaming(ctx, os.Stdout, slowThreshold)
-	}
-
-	// Print summary (checks were already printed during streaming)
-	report.PrintSummaryOnly(os.Stdout, doctorVerbose, slowThreshold)
-
-	// Exit with error code if there are errors
-	if report.HasErrors() {
-		return fmt.Errorf("doctor found %d error(s)", report.Summary.Errors)
-	}
-
-	return nil
+	return d
 }

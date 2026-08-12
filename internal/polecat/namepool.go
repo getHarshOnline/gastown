@@ -8,18 +8,18 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/lock"
-	"github.com/steveyegge/gastown/internal/util"
 )
 
 const (
 	// DefaultPoolSize is the number of name slots in the pool.
-	// Names are allocated when a polecat is first created. In the persistent
-	// polecat model (gt-4ac), polecats cycle IDLE → WORKING → DONE → IDLE,
-	// keeping their name, identity, and sandbox across assignments.
+	// Names are allocated when a polecat is first created. Polecat identity persists,
+	// while clean completion retires the live session and cleanup owns remaining state.
 	DefaultPoolSize = 50
 
 	// DefaultTheme is the default theme for new rigs.
@@ -174,6 +174,7 @@ func (p *NamePool) getNames() []string {
 		if resolved, err := ResolveThemeNames(p.townRoot, p.Theme); err == nil {
 			names = resolved
 		} else {
+			fmt.Fprintf(os.Stderr, "Warning: namepool theme %q not found (not built-in, no custom theme file); using default\n", p.Theme)
 			names = BuiltinThemes[DefaultTheme]
 		}
 	} else {
@@ -260,7 +261,7 @@ func (p *NamePool) Save() error {
 		MaxSize:      p.MaxSize,
 	}
 
-	return util.AtomicWriteJSON(p.stateFile, state)
+	return atomicfile.WriteJSON(p.stateFile, state)
 }
 
 // Allocate returns a name from the pool.
@@ -361,6 +362,10 @@ func (p *NamePool) Reconcile(existingPolecats []string) {
 	for _, name := range existingPolecats {
 		if p.isThemedName(name) {
 			p.InUse[name] = true
+			continue
+		}
+		if seq, err := strconv.Atoi(name); err == nil && seq >= p.OverflowNext {
+			p.OverflowNext = seq + 1
 		}
 	}
 }
@@ -439,6 +444,45 @@ func ThemeForRig(rigName string) string {
 		hash = hash*31 + uint32(b)
 	}
 	return themes[hash%uint32(len(themes))] //nolint:gosec // len(themes) is small constant
+}
+
+// ThemeForRigAvoiding picks a theme for rigName that is not already in usedThemes.
+// This ensures polecat names are unique across rigs by giving each rig a different theme.
+// If all built-in themes are taken, falls back to the hash-based ThemeForRig result.
+func ThemeForRigAvoiding(rigName string, usedThemes []string) string {
+	themes := ListThemes()
+	if len(themes) == 0 {
+		return DefaultTheme
+	}
+
+	used := make(map[string]bool, len(usedThemes))
+	for _, t := range usedThemes {
+		used[t] = true
+	}
+
+	// Try to find an unused theme
+	var available []string
+	for _, t := range themes {
+		if !used[t] {
+			available = append(available, t)
+		}
+	}
+
+	if len(available) == 0 {
+		// All built-in themes taken — fall back to hash-based selection
+		return ThemeForRig(rigName)
+	}
+
+	if len(available) == 1 {
+		return available[0]
+	}
+
+	// Deterministic pick from available themes using rig name hash
+	var hash uint32
+	for _, b := range []byte(rigName) {
+		hash = hash*31 + uint32(b)
+	}
+	return available[hash%uint32(len(available))] //nolint:gosec // len(available) is small
 }
 
 // GetThemeNames returns the names in a specific built-in theme.

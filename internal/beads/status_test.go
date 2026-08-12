@@ -10,6 +10,7 @@ func TestAgentStateProtectsFromCleanup(t *testing.T) {
 	}{
 		{AgentStateStuck, true},
 		{AgentStateAwaitingGate, true},
+		{AgentStatePaused, true},
 		{AgentStateWorking, false},
 		{AgentStateIdle, false},
 		{AgentStateDone, false},
@@ -17,6 +18,7 @@ func TestAgentStateProtectsFromCleanup(t *testing.T) {
 		{AgentStateNuked, false},
 		{AgentStateRunning, false},
 		{AgentStateEscalated, false},
+		{AgentStatePatrolling, false},
 		{AgentState(""), false},
 	}
 	for _, tt := range tests {
@@ -35,10 +37,12 @@ func TestAgentStateIsActive(t *testing.T) {
 		{AgentStateWorking, true},
 		{AgentStateRunning, true},
 		{AgentStateSpawning, true},
+		{AgentStatePatrolling, true},
 		{AgentStateIdle, false},
 		{AgentStateDone, false},
 		{AgentStateStuck, false},
 		{AgentStateNuked, false},
+		{AgentStatePaused, false},
 	}
 	for _, tt := range tests {
 		if got := tt.state.IsActive(); got != tt.want {
@@ -59,6 +63,7 @@ func TestIssueStatusBlocksRemoval(t *testing.T) {
 		{IssueStatusPinned, false},
 		{StatusInProgress, false},
 		{StatusTombstone, false},
+		{StatusDeferred, false},
 	}
 	for _, tt := range tests {
 		if got := tt.status.BlocksRemoval(); got != tt.want {
@@ -79,6 +84,7 @@ func TestIssueStatusIsTerminal(t *testing.T) {
 		{IssueStatusHooked, false},
 		{StatusInProgress, false},
 		{IssueStatusPinned, false},
+		{StatusDeferred, false},
 	}
 	for _, tt := range tests {
 		if got := tt.status.IsTerminal(); got != tt.want {
@@ -98,6 +104,7 @@ func TestIssueStatusIsAssigned(t *testing.T) {
 		{StatusOpen, false},
 		{StatusClosed, false},
 		{IssueStatusPinned, false},
+		{StatusDeferred, false},
 	}
 	for _, tt := range tests {
 		if got := tt.status.IsAssigned(); got != tt.want {
@@ -119,6 +126,8 @@ func TestAgentStateConstants(t *testing.T) {
 		AgentStateRunning:      "running",
 		AgentStateNuked:        "nuked",
 		AgentStateAwaitingGate: "awaiting-gate",
+		AgentStatePatrolling:   "patrolling",
+		AgentStatePaused:       "paused",
 	}
 	for state, expected := range states {
 		if string(state) != expected {
@@ -135,6 +144,7 @@ func TestIssueStatusConstants(t *testing.T) {
 		StatusInProgress:  "in_progress",
 		StatusTombstone:   "tombstone",
 		StatusBlocked:     "blocked",
+		StatusDeferred:    "deferred",
 		IssueStatusPinned: "pinned",
 		IssueStatusHooked: "hooked",
 	}

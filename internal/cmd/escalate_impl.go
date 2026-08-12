@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -76,6 +78,9 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		if escalateSource != "" {
 			fmt.Printf("  Source: %s\n", escalateSource)
 		}
+		if escalateFingerprint != "" {
+			fmt.Printf("  Fingerprint: %s\n", escalationFingerprintLabel(escalateFingerprint))
+		}
 		fmt.Printf("  Actions: %s\n", strings.Join(actions, ", "))
 		fmt.Printf("  Mail targets: %s\n", strings.Join(targets, ", "))
 		return nil
@@ -83,6 +88,29 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 
 	// Create escalation bead
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
+	fingerprintLabel := escalationFingerprintLabel(escalateFingerprint)
+	if fingerprintLabel != "" {
+		matches, err := bd.ListEscalationsByFingerprint(fingerprintLabel)
+		if err != nil {
+			return fmt.Errorf("checking escalation fingerprint: %w", err)
+		}
+		if len(matches) > 0 {
+			existing := matches[0]
+			if escalateJSON {
+				result := map[string]interface{}{
+					"id":          existing.ID,
+					"status":      "duplicate_suppressed",
+					"fingerprint": fingerprintLabel,
+				}
+				out, _ := json.MarshalIndent(result, "", "  ")
+				fmt.Println(string(out))
+			} else {
+				fmt.Printf("%s Duplicate escalation suppressed: %s\n", style.Bold.Render("✓"), existing.ID)
+				fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
+			}
+			return nil
+		}
+	}
 	fields := &beads.EscalationFields{
 		Severity:    severity,
 		Reason:      escalateReason,
@@ -90,6 +118,7 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		EscalatedBy: agentID,
 		EscalatedAt: time.Now().Format(time.RFC3339),
 		RelatedBead: escalateRelatedBead,
+		Fingerprint: fingerprintLabel,
 	}
 
 	issue, err := bd.CreateEscalationBead(description, fields)
@@ -191,6 +220,9 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		if escalateSource != "" {
 			result["source"] = escalateSource
 		}
+		if fingerprintLabel != "" {
+			result["fingerprint"] = fingerprintLabel
+		}
 		out, _ := json.MarshalIndent(result, "", "  ")
 		fmt.Println(string(out))
 	} else {
@@ -199,6 +231,9 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Severity: %s\n", severity)
 		if escalateSource != "" {
 			fmt.Printf("  Source: %s\n", escalateSource)
+		}
+		if fingerprintLabel != "" {
+			fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
 		}
 		fmt.Printf("  Routed to: %s\n", strings.Join(targets, ", "))
 		for _, status := range statuses {
@@ -209,6 +244,15 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func escalationFingerprintLabel(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return fmt.Sprintf("escalation-fp:%x", sum[:6])
 }
 
 type deliveryStatus struct {
@@ -249,6 +293,28 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Cross-check each entry against live Dolt to filter out phantom escalations.
+	// When a rig's Dolt server dies and is restarted fresh, the label-based list
+	// query may still return stale IDs (e.g. from a cached or cross-rig query)
+	// that no longer exist in the live database. We skip any entries that cannot
+	// be fetched individually, since they cannot be acked or closed anyway.
+	var live []*beads.Issue
+	var phantomCount int
+	for _, issue := range issues {
+		if _, err := bd.Show(issue.ID); err != nil {
+			if errors.Is(err, beads.ErrNotFound) {
+				phantomCount++
+				fmt.Fprintf(os.Stderr, "warning: skipping unresolvable escalation %s (not found in live Dolt)\n", issue.ID)
+				continue
+			}
+			// For other errors (e.g. Dolt temporarily unreachable), include
+			// the entry so the user can see it — just warn.
+			fmt.Fprintf(os.Stderr, "warning: could not verify escalation %s: %v\n", issue.ID, err)
+		}
+		live = append(live, issue)
+	}
+	issues = live
+
 	if escalateListJSON {
 		out, _ := json.MarshalIndent(issues, "", "  ")
 		fmt.Println(string(out))
@@ -256,7 +322,12 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(issues) == 0 {
-		fmt.Println("No escalations found")
+		if phantomCount > 0 {
+			fmt.Printf("No escalations found (%d phantom entr%s skipped — bead IDs no longer exist in live Dolt)\n",
+				phantomCount, map[bool]string{true: "y", false: "ies"}[phantomCount == 1])
+		} else {
+			fmt.Println("No escalations found")
+		}
 		return nil
 	}
 

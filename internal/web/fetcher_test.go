@@ -2,10 +2,12 @@ package web
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -574,6 +576,112 @@ esac
 	})
 }
 
+func TestFetchConvoysBreakerBacksOffAfterBdFailures(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based command test")
+	}
+
+	tests := []struct {
+		name   string
+		script string
+	}{
+		{
+			name: "nonzero exit",
+			script: `#!/bin/sh
+printf x >> "$0.count"
+exit 1
+`,
+		},
+		{
+			name: "invalid JSON",
+			script: `#!/bin/sh
+printf x >> "$0.count"
+printf '{invalid'
+exit 0
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bdPath := filepath.Join(t.TempDir(), "bd")
+			if err := os.WriteFile(bdPath, []byte(tt.script), 0o755); err != nil {
+				t.Fatalf("write fake bd: %v", err)
+			}
+
+			f := &LiveConvoyFetcher{townRoot: t.TempDir(), cmdTimeout: 5 * time.Second, bdBin: bdPath}
+			if _, err := f.FetchConvoys(); err == nil {
+				t.Fatal("expected first FetchConvoys call to fail")
+			}
+
+			if _, err := f.FetchConvoys(); err != nil {
+				t.Fatalf("expected immediate retry to be backed off silently, got: %v", err)
+			}
+
+			countBytes, err := os.ReadFile(bdPath + ".count")
+			if err != nil {
+				t.Fatalf("read fake bd call count: %v", err)
+			}
+			if got := len(countBytes); got != 1 {
+				t.Fatalf("fake bd calls = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestFetchConvoysBreakerPreventsConcurrentStampede(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based command test")
+	}
+
+	bdPath := filepath.Join(t.TempDir(), "bd")
+	script := `#!/bin/sh
+printf x >> "$0.count"
+sleep 0.2
+printf '{invalid'
+exit 0
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+
+	f := &LiveConvoyFetcher{townRoot: t.TempDir(), cmdTimeout: 5 * time.Second, bdBin: bdPath}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errCh := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := f.FetchConvoys()
+			errCh <- err
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	errCount := 0
+	for err := range errCh {
+		if err != nil {
+			errCount++
+		}
+	}
+	if errCount != 1 {
+		t.Fatalf("FetchConvoys errors = %d, want 1; backed-off callers should return nil", errCount)
+	}
+
+	countBytes, err := os.ReadFile(bdPath + ".count")
+	if err != nil {
+		t.Fatalf("read fake bd call count: %v", err)
+	}
+	if got := len(countBytes); got != 1 {
+		t.Fatalf("fake bd calls = %d, want 1", got)
+	}
+}
+
 func withMayorFetcherHooks(t *testing.T, sessionEnv func(sessionName, key string) (string, error), runCmdFunc func(time.Duration, string, ...string) (*bytes.Buffer, error)) {
 	t.Helper()
 
@@ -840,5 +948,58 @@ func TestFetchMayor_UsesResolvedRuntime(t *testing.T) {
 	}
 	if status.LastActivity == "" {
 		t.Fatal("expected LastActivity to be populated")
+	}
+}
+
+// TestFetchHealth_DeaconHeartbeatFieldName verifies that FetchHealth reads the
+// "timestamp" field written by heartbeat.go, not the old "last_heartbeat" field
+// that caused dashboard to always show "no timestamp". (GH#2989)
+func TestFetchHealth_DeaconHeartbeatFieldName(t *testing.T) {
+	townRoot := t.TempDir()
+	deaconDir := filepath.Join(townRoot, "deacon")
+	if err := os.MkdirAll(deaconDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write heartbeat.json using the field name heartbeat.go actually writes.
+	now := time.Now().UTC().Truncate(time.Second)
+	heartbeatJSON := fmt.Sprintf(`{"timestamp":%q,"cycle":42,"healthy_agents":3,"unhealthy_agents":1}`,
+		now.Format(time.RFC3339))
+	if err := os.WriteFile(filepath.Join(deaconDir, "heartbeat.json"), []byte(heartbeatJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	f := &LiveConvoyFetcher{
+		townRoot:                townRoot,
+		heartbeatFreshThreshold: 5 * time.Minute,
+	}
+
+	health, err := f.FetchHealth()
+	if err != nil {
+		t.Fatalf("FetchHealth: %v", err)
+	}
+
+	// DeaconHeartbeat must NOT be "no timestamp" — the field was read correctly.
+	if health.DeaconHeartbeat == "no timestamp" {
+		t.Fatal("DeaconHeartbeat = \"no timestamp\": JSON field name mismatch (GH#2989)")
+	}
+	if health.DeaconHeartbeat == "no heartbeat" {
+		t.Fatal("DeaconHeartbeat = \"no heartbeat\": heartbeat file was not read")
+	}
+
+	// Cycle and agent counts should be populated.
+	if health.DeaconCycle != 42 {
+		t.Errorf("DeaconCycle = %d, want 42", health.DeaconCycle)
+	}
+	if health.HealthyAgents != 3 {
+		t.Errorf("HealthyAgents = %d, want 3", health.HealthyAgents)
+	}
+	if health.UnhealthyAgents != 1 {
+		t.Errorf("UnhealthyAgents = %d, want 1", health.UnhealthyAgents)
+	}
+
+	// Heartbeat should be considered fresh (written just now).
+	if !health.HeartbeatFresh {
+		t.Error("HeartbeatFresh = false for a just-written heartbeat")
 	}
 }

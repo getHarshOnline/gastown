@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -309,6 +310,11 @@ func cleanStaleBeadsFiles(beadsDir string) error {
 		return fmt.Errorf("no redirect file found - refusing to clean")
 	}
 
+	// Preserve redirect-local metadata only when it agrees with the redirect
+	// target. If it points at a different DB, it is stale drift and must be
+	// removed so bd follows the canonical target metadata.
+	preserveMetadata := shouldPreserveRedirectMetadata(beadsDir)
+
 	// Remove files matching stale patterns
 	for _, pattern := range staleFilePatterns {
 		matches, err := filepath.Glob(filepath.Join(beadsDir, pattern))
@@ -316,6 +322,9 @@ func cleanStaleBeadsFiles(beadsDir string) error {
 			continue
 		}
 		for _, match := range matches {
+			if preserveMetadata && filepath.Base(match) == "metadata.json" {
+				continue
+			}
 			if err := os.RemoveAll(match); err != nil {
 				return fmt.Errorf("removing %s: %w", filepath.Base(match), err)
 			}
@@ -331,6 +340,50 @@ func cleanStaleBeadsFiles(beadsDir string) error {
 	}
 
 	return nil
+}
+
+// metadataDoltDatabase returns the metadata.json dolt_database value, if any.
+func metadataDoltDatabase(beadsDir string) string {
+	data, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
+	if err != nil {
+		return ""
+	}
+	var meta struct {
+		DoltDatabase string `json:"dolt_database"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(meta.DoltDatabase)
+}
+
+func shouldPreserveRedirectMetadata(beadsDir string) bool {
+	db := metadataDoltDatabase(beadsDir)
+	if db == "" {
+		return false
+	}
+
+	targetDir := redirectTargetDir(beadsDir)
+	if targetDir == "" {
+		return true
+	}
+	targetDB := metadataDoltDatabase(targetDir)
+	return targetDB == "" || targetDB == db
+}
+
+func redirectTargetDir(beadsDir string) string {
+	data, err := os.ReadFile(filepath.Join(beadsDir, "redirect"))
+	if err != nil {
+		return ""
+	}
+	target := strings.TrimSpace(string(data))
+	if target == "" {
+		return ""
+	}
+	if filepath.IsAbs(target) {
+		return filepath.Clean(target)
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(beadsDir), target))
 }
 
 // verifyRedirectTopology checks that all worktrees in a rig have correct redirects.

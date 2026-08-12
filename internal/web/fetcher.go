@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/activity"
@@ -42,6 +43,17 @@ func runCmd(timeout time.Duration, name string, args ...string) (*bytes.Buffer, 
 		return nil, err
 	}
 	return &stdout, nil
+}
+
+// runTmuxCmd runs a tmux command using the per-town socket.
+// Without -L, tmux queries the default socket which has no Gas Town sessions.
+func (f *LiveConvoyFetcher) runTmuxCmd(args ...string) (*bytes.Buffer, error) {
+	fullArgs := []string{}
+	if f.tmuxSocket != "" {
+		fullArgs = append(fullArgs, "-L", f.tmuxSocket)
+	}
+	fullArgs = append(fullArgs, args...)
+	return fetcherRunCmd(f.tmuxCmdTimeout, "tmux", fullArgs...)
 }
 
 var fetcherRunCmd = runCmd
@@ -80,6 +92,63 @@ func (f *LiveConvoyFetcher) runBdCmd(beadsDir string, args ...string) (*bytes.Bu
 	return &stdout, nil
 }
 
+// fetchCircuitBreaker tracks consecutive failures for a fetch operation
+// and applies exponential backoff to prevent process storms.
+type fetchCircuitBreaker struct {
+	mu          sync.Mutex
+	failures    int
+	lastAttempt time.Time
+	backoff     time.Duration
+	inFlight    bool
+}
+
+// maxBackoff is the maximum backoff duration for the circuit breaker.
+const maxBackoff = 5 * time.Minute
+
+// allow returns true if enough time has passed since the last failure to permit
+// a new attempt, and reserves that attempt so concurrent callers do not all
+// stampede through when backoff opens.
+func (cb *fetchCircuitBreaker) allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.inFlight {
+		return false
+	}
+	if cb.failures == 0 {
+		cb.inFlight = true
+		return true
+	}
+	if time.Since(cb.lastAttempt) < cb.backoff {
+		return false
+	}
+	cb.inFlight = true
+	return true
+}
+
+// recordFailure increments the failure count and sets exponential backoff.
+// Backoff doubles from 10s up to maxBackoff.
+func (cb *fetchCircuitBreaker) recordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	cb.lastAttempt = time.Now()
+	cb.inFlight = false
+	// Exponential backoff: 10s, 20s, 40s, 80s, 160s, capped at maxBackoff
+	cb.backoff = time.Duration(1<<min(cb.failures, 10)) * 5 * time.Second
+	if cb.backoff > maxBackoff {
+		cb.backoff = maxBackoff
+	}
+}
+
+// recordSuccess resets the circuit breaker on a successful fetch.
+func (cb *fetchCircuitBreaker) recordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures = 0
+	cb.backoff = 0
+	cb.inFlight = false
+}
+
 // LiveConvoyFetcher fetches convoy data from beads.
 type LiveConvoyFetcher struct {
 	townRoot  string
@@ -87,6 +156,12 @@ type LiveConvoyFetcher struct {
 
 	// bdBin is the bd binary name or path. Defaults to "bd" if empty.
 	bdBin string
+
+	// registry is a prefix registry built from the town's rigs.json.
+	// Used for parsing tmux session names instead of relying on the
+	// package-level DefaultRegistry, which may not be initialized in
+	// the dashboard process context.
+	registry *session.PrefixRegistry
 
 	// Configurable timeouts (from TownSettings.WebTimeouts)
 	cmdTimeout     time.Duration
@@ -98,6 +173,15 @@ type LiveConvoyFetcher struct {
 	stuckThreshold          time.Duration
 	heartbeatFreshThreshold time.Duration
 	mayorActiveThreshold    time.Duration
+
+	// tmuxSocket is the per-town tmux socket name (e.g., "dipgt-651c6b").
+	// All tmux commands must use -L with this socket; the default socket
+	// has no Gas Town sessions.
+	tmuxSocket string
+
+	// Circuit breaker for FetchConvoys — prevents process storms when
+	// bd list by convoy label fails persistently (e.g., schema mismatch).
+	convoyBreaker fetchCircuitBreaker
 }
 
 // NewLiveConvoyFetcher creates a fetcher for the current workspace.
@@ -121,9 +205,20 @@ func NewLiveConvoyFetcher() (*LiveConvoyFetcher, error) {
 		}
 	}
 
+	// Build a local prefix registry from the town's rigs.json so session
+	// name parsing works regardless of whether the package-level
+	// DefaultRegistry was initialized (gt-y24).
+	registry, regErr := session.BuildPrefixRegistryFromTown(townRoot)
+	if regErr != nil {
+		log.Printf("dashboard: failed to build prefix registry: %v (falling back to default)", regErr)
+		registry = session.DefaultRegistry()
+	}
+
 	return &LiveConvoyFetcher{
 		townRoot:                townRoot,
 		townBeads:               filepath.Join(townRoot, ".beads"),
+		registry:                registry,
+		tmuxSocket:              tmux.GetDefaultSocket(),
 		cmdTimeout:              config.ParseDurationOrDefault(webCfg.CmdTimeout, 15*time.Second),
 		ghCmdTimeout:            config.ParseDurationOrDefault(webCfg.GhCmdTimeout, 10*time.Second),
 		tmuxCmdTimeout:          config.ParseDurationOrDefault(webCfg.TmuxCmdTimeout, 2*time.Second),
@@ -135,26 +230,39 @@ func NewLiveConvoyFetcher() (*LiveConvoyFetcher, error) {
 }
 
 // FetchConvoys fetches all open convoys with their activity data.
+// Uses a circuit breaker to avoid hammering bd/dolt when listing fails
+// persistently (e.g., "invalid issue type: convoy" schema mismatch).
 func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
-	// List all open convoy issues
-	stdout, err := f.runBdCmd(f.townRoot, "list", "--type=convoy", "--status=open", "--json")
+	if !f.convoyBreaker.allow() {
+		return nil, nil // Backed off — return empty result silently
+	}
+
+	// List all open issues and filter locally so legacy type=convoy beads remain visible.
+	stdout, err := f.runBdCmd(f.townRoot, "list", "--status=open", "--json", "--limit=0")
 	if err != nil {
+		f.convoyBreaker.recordFailure()
 		return nil, fmt.Errorf("listing convoys: %w", err)
 	}
 
 	var convoys []struct {
-		ID        string `json:"id"`
-		Title     string `json:"title"`
-		Status    string `json:"status"`
-		CreatedAt string `json:"created_at"`
+		ID        string   `json:"id"`
+		Title     string   `json:"title"`
+		Status    string   `json:"status"`
+		CreatedAt string   `json:"created_at"`
+		IssueType string   `json:"issue_type"`
+		Labels    []string `json:"labels"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
+		f.convoyBreaker.recordFailure()
 		return nil, fmt.Errorf("parsing convoy list: %w", err)
 	}
 
 	// Build convoy rows with activity data
 	rows := make([]ConvoyRow, 0, len(convoys))
 	for _, c := range convoys {
+		if c.IssueType != "convoy" && !webConvoyHasLabel(c.Labels, "gt:convoy") {
+			continue
+		}
 		row := ConvoyRow{
 			ID:     c.ID,
 			Title:  c.Title,
@@ -254,7 +362,17 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 		rows = append(rows, row)
 	}
 
+	f.convoyBreaker.recordSuccess()
 	return rows, nil
+}
+
+func webConvoyHasLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if label == target {
+			return true
+		}
+	}
+	return false
 }
 
 // trackedIssueInfo holds info about an issue being tracked by a convoy.
@@ -435,7 +553,7 @@ func (f *LiveConvoyFetcher) getSessionActivityForAssignee(assignee string) *time
 
 	// Query tmux for session activity
 	// Format: session_activity returns unix timestamp
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}|#{session_activity}",
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{session_activity}",
 		"-f", fmt.Sprintf("#{==:#{session_name},%s}", sessionName))
 	if err != nil {
 		return nil
@@ -467,7 +585,7 @@ func (f *LiveConvoyFetcher) getSessionActivityForAssignee(assignee string) *time
 func (f *LiveConvoyFetcher) getAllPolecatActivity() *time.Time {
 	// List all tmux sessions matching gt-*-* pattern (polecat sessions)
 	// Format: gt-{rig}-{polecat}
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}|#{session_activity}")
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{session_activity}")
 	if err != nil {
 		return nil
 	}
@@ -485,8 +603,10 @@ func (f *LiveConvoyFetcher) getAllPolecatActivity() *time.Time {
 		}
 
 		sessionName := parts[0]
-		// Check if it's a polecat or crew session (skip infrastructure roles)
-		identity, err := session.ParseSessionName(sessionName)
+		// Check if it's a polecat or crew session (skip infrastructure roles).
+		// Use the fetcher's own registry to avoid dependency on global
+		// DefaultRegistry initialization (gt-y24).
+		identity, err := session.ParseSessionNameWithRegistry(sessionName, f.registry)
 		if err != nil {
 			continue
 		}
@@ -725,7 +845,7 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 	assignedIssues := f.getAssignedIssuesMap()
 
 	// Query all tmux sessions with window_activity for more accurate timing
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}|#{window_activity}")
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{window_activity}")
 	if err != nil {
 		// tmux not running or no sessions
 		return nil, nil
@@ -749,10 +869,11 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 
 		sessionName := parts[0]
 
-		// Filter for gt-<rig>-<polecat> pattern
-		// Parse session name using canonical parser
-		identity, err := session.ParseSessionName(sessionName)
+		// Parse session name using the fetcher's own registry to avoid
+		// dependency on global DefaultRegistry initialization (gt-y24).
+		identity, err := session.ParseSessionNameWithRegistry(sessionName, f.registry)
 		if err != nil {
+			log.Printf("dashboard: FetchWorkers: skipping session %q: %v", sessionName, err)
 			continue
 		}
 
@@ -887,7 +1008,7 @@ func calculateWorkerWorkStatus(activityAge time.Duration, issueID, workerName st
 
 // getWorkerStatusHint captures the last non-empty line from a worker's pane.
 func (f *LiveConvoyFetcher) getWorkerStatusHint(sessionName string) string {
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "capture-pane", "-t", sessionName, "-p", "-J")
+	stdout, err := f.runTmuxCmd("capture-pane", "-t", sessionName, "-p", "-J")
 	if err != nil {
 		return ""
 	}
@@ -1254,7 +1375,7 @@ func (f *LiveConvoyFetcher) FetchHealth() (*HealthRow, error) {
 	heartbeatFile := filepath.Join(f.townRoot, "deacon", "heartbeat.json")
 	if data, err := os.ReadFile(heartbeatFile); err == nil {
 		var hb struct {
-			LastHeartbeat   time.Time `json:"last_heartbeat"`
+			LastHeartbeat   time.Time `json:"timestamp"`
 			Cycle           int64     `json:"cycle"`
 			HealthyAgents   int       `json:"healthy_agents"`
 			UnhealthyAgents int       `json:"unhealthy_agents"`
@@ -1347,7 +1468,7 @@ func (f *LiveConvoyFetcher) FetchQueues() ([]QueueRow, error) {
 // FetchSessions returns active tmux sessions with role detection.
 func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 	// List tmux sessions
-	stdout, err := fetcherRunCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}:#{session_activity}")
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}:#{session_activity}")
 	if err != nil {
 		return nil, nil // tmux not running or no sessions
 	}
@@ -1379,8 +1500,8 @@ func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 			}
 		}
 
-		// Detect role from session name using canonical parser
-		if identity, err := session.ParseSessionName(name); err == nil {
+		// Detect role from session name using fetcher's own registry (gt-y24)
+		if identity, err := session.ParseSessionNameWithRegistry(name, f.registry); err == nil {
 			row.Rig = identity.Rig
 			row.Role = string(identity.Role)
 			row.Worker = identity.Name
@@ -1465,7 +1586,7 @@ func (f *LiveConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 	mayorSessionName := session.MayorSessionName()
 
 	// Check if mayor tmux session exists
-	stdout, err := fetcherRunCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}:#{session_activity}")
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}:#{session_activity}")
 	if err != nil {
 		// tmux not running or no sessions
 		return status, nil
@@ -1545,21 +1666,31 @@ func runtimeLabelFromConfig(command string, args []string, fallback string) stri
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if (arg == "--model" || arg == "-m") && i+1 < len(args) && strings.TrimSpace(args[i+1]) != "" {
-			return cmd + "/" + strings.TrimSpace(args[i+1])
+			return cmd + "/" + stripModelSuffix(strings.TrimSpace(args[i+1]))
 		}
 		if strings.HasPrefix(arg, "--model=") {
 			if v := strings.TrimSpace(strings.TrimPrefix(arg, "--model=")); v != "" {
-				return cmd + "/" + v
+				return cmd + "/" + stripModelSuffix(v)
 			}
 		}
 		if strings.HasPrefix(arg, "-m=") {
 			if v := strings.TrimSpace(strings.TrimPrefix(arg, "-m=")); v != "" {
-				return cmd + "/" + v
+				return cmd + "/" + stripModelSuffix(v)
 			}
 		}
 	}
 
 	return cmd
+}
+
+// stripModelSuffix removes bracketed context-window hints (e.g. "[1m]")
+// from model names so the dashboard label stays human-readable.
+// "sonnet[1m]" → "sonnet", "opus" → "opus".
+func stripModelSuffix(model string) string {
+	if idx := strings.Index(model, "["); idx > 0 {
+		return model[:idx]
+	}
+	return model
 }
 
 // FetchIssues returns open issues (the backlog).

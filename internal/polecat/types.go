@@ -5,23 +5,26 @@ import "time"
 
 // State represents the current lifecycle state of a polecat.
 //
-// Polecats are PERSISTENT: they survive work completion and can be reused.
-// The four operating states are:
+// Polecat identity is persistent, but clean completion retires the live session.
+// The primary operating states are:
 //
 //   - Working: Session active, doing assigned work (normal operation)
-//   - Idle: Work completed, session killed, sandbox preserved for reuse
+//   - Idle: Available before assignment, with no pending completion cleanup
+//   - Done: Work completed, session retired, cleanup/refinery still owns state
+//   - ReviewNeeded: Session is live but no active work bead is attached
 //   - Stalled: Session stopped unexpectedly, was never nudged back to life
 //   - Zombie: Session called 'gt done' but cleanup failed - tried to die but couldn't
 //
-// The distinction matters: idle polecats completed their work successfully and
-// are ready for new assignments. Stalled polecats failed mid-work. Zombies
-// tried to exit but couldn't complete cleanup.
+// The distinction matters: idle polecats are available capacity. Done polecats
+// completed work and are waiting for cleanup/refinery state to clear. Stalled
+// polecats failed mid-work. Zombies tried to exit but couldn't complete cleanup.
 //
-// Note: These are LIFECYCLE states. The polecat IDENTITY (CV chain, mailbox, work
-// history) and SANDBOX (worktree) persist across sessions. An idle polecat keeps
-// its worktree so it can be quickly reassigned without creating a new one.
+// Note: These are LIFECYCLE states. The polecat IDENTITY (CV chain, mailbox,
+// work history) persists across sessions. Worktrees persist only while active
+// or awaiting cleanup; they are not reused after clean completion with pending state.
 //
-// "Stalled" and "zombie" are detected conditions, not stored states. The Witness
+// "Stalled", "zombie", and related conditions are detected at query time by
+// cross-checking tmux session liveness against beads state. The Witness also
 // detects them through monitoring (tmux state, age in StateDone, etc.).
 type State string
 
@@ -30,10 +33,8 @@ const (
 	// This is the initial and primary state after sling.
 	StateWorking State = "working"
 
-	// StateIdle means the polecat completed its work and the session was killed,
-	// but the sandbox (worktree) is preserved for reuse. An idle polecat has no
-	// hook_bead and no active session. It can be reassigned via gt sling without
-	// creating a new worktree.
+	// StateIdle means the polecat is available before assignment. It has no
+	// hook_bead, no active session, and no pending completion/MR cleanup state.
 	StateIdle State = "idle"
 
 	// StateDone means the polecat has completed its assigned work and called
@@ -42,10 +43,24 @@ const (
 	// the cleanup failed and the session is stuck.
 	StateDone State = "done"
 
+	// StateReviewNeeded means a tmux session is still live but no current hooked
+	// or assigned work bead exists, and cleanup status is not clean enough to
+	// reuse safely. This prevents reporting "working" with Issue:none without
+	// making the slot reusable before recovery decides what to do with the branch.
+	StateReviewNeeded State = "review-needed"
+
 	// StateStuck means the polecat has explicitly signaled it needs assistance.
 	// This is an intentional request for help from the polecat itself.
 	// Different from "stalled" (detected externally when session stops working).
 	StateStuck State = "stuck"
+
+	// StateStalled means the polecat's tmux session has died while work was still
+	// assigned. This is a detected condition: beads report the polecat as working
+	// (hooked bead, assigned issue) but the tmux session is gone or the agent
+	// process is dead. This typically happens after disk space exhaustion, OOM,
+	// or other system failures that kill sessions without cleanup.
+	// Unlike "stuck" (polecat self-reports), stalled is detected externally.
+	StateStalled State = "stalled"
 
 	// StateZombie means a tmux session exists but has no corresponding worktree directory.
 	// This is a detected condition: the polecat was incompletely nuked or has a
@@ -56,6 +71,11 @@ const (
 // IsWorking returns true if the polecat is currently working.
 func (s State) IsWorking() bool {
 	return s == StateWorking
+}
+
+// IsStalled returns true if the polecat's session has died while work was assigned.
+func (s State) IsStalled() bool {
+	return s == StateStalled
 }
 
 // IsIdle returns true if the polecat has completed work and is available for reuse.
@@ -146,7 +166,8 @@ func (s CleanupStatus) RequiresRecovery() bool {
 }
 
 // CanForceRemove returns true if the status allows forced removal.
-// Uncommitted changes can be force-removed, but stashes and unpushed commits cannot.
+// Force removal bypasses all git safety checks including unpushed commits.
+// Stashes are excluded since they represent intentional work-in-progress.
 func (s CleanupStatus) CanForceRemove() bool {
-	return s == CleanupClean || s == CleanupUncommitted
+	return s == CleanupClean || s == CleanupUncommitted || s == CleanupUnpushed
 }

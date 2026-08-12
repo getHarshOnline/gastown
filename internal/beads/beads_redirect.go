@@ -2,9 +2,11 @@
 package beads
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -108,12 +110,26 @@ func resolveBeadsDirWithDepth(beadsDir string, maxDepth int) string {
 	return resolveBeadsDirWithDepth(resolved, maxDepth-1)
 }
 
-// cleanBeadsRuntimeFiles removes gitignored runtime files from a .beads directory
-// while preserving tracked files (formulas/, README.md, config.yaml, .gitignore).
+// cleanBeadsRuntimeFiles removes redirect-local runtime and identity files from a
+// .beads directory while preserving tracked docs/formula surfaces (formulas/,
+// README.md, .gitignore). Identity files next to a redirect can make bd bind to
+// the wrong database, so tracked identity files are hidden before removal.
 // This is safe to call even if the directory doesn't exist.
 func cleanBeadsRuntimeFiles(beadsDir string) error {
-	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+	info, err := os.Lstat(beadsDir)
+	if os.IsNotExist(err) {
 		return nil // Nothing to clean
+	} else if err != nil {
+		return err
+	} else if !info.IsDir() {
+		return nil
+	}
+
+	worktreePath := filepath.Dir(beadsDir)
+	for _, name := range []string{"metadata.json", "config.yaml"} {
+		if err := removeWorktreeIdentityFile(worktreePath, filepath.Join(beadsDir, name)); err != nil {
+			return err
+		}
 	}
 
 	// Runtime files/patterns that are gitignored and safe to remove
@@ -121,7 +137,7 @@ func cleanBeadsRuntimeFiles(beadsDir string) error {
 		// Daemon runtime
 		"daemon.lock", "daemon.log", "daemon.pid", "bd.sock",
 		// Sync state
-		"last-touched", "metadata.json",
+		"last-touched",
 		// Version tracking
 		".local_version",
 		// Redirect file (we're about to recreate it)
@@ -149,6 +165,63 @@ func cleanBeadsRuntimeFiles(beadsDir string) error {
 	return firstErr
 }
 
+func removeWorktreeIdentityFile(worktreePath, path string) error {
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("checking %s: %w", path, err)
+	}
+
+	rel, err := filepath.Rel(worktreePath, path)
+	if err != nil {
+		return fmt.Errorf("computing git path for %s: %w", path, err)
+	}
+	if rel == "." || rel == "" || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("refusing to clean identity file outside worktree: %s", path)
+	}
+	rel = filepath.ToSlash(rel)
+
+	tracked, err := gitPathTracked(worktreePath, rel)
+	if err != nil {
+		return err
+	}
+	if tracked {
+		if err := markGitPathSkipWorktree(worktreePath, rel); err != nil {
+			return err
+		}
+	}
+
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing %s: %w", path, err)
+	}
+	return nil
+}
+
+func gitPathTracked(worktreePath, relPath string) (bool, error) {
+	cmd := exec.Command("git", "-C", worktreePath, "ls-files", "--stage", "--", relPath) //nolint:gosec // argv is fixed; relPath is passed after --.
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("git ls-files %s: %w%s", relPath, err, gitOutputSuffix(out))
+	}
+	return len(bytes.TrimSpace(out)) > 0, nil
+}
+
+func markGitPathSkipWorktree(worktreePath, relPath string) error {
+	cmd := exec.Command("git", "-C", worktreePath, "update-index", "--skip-worktree", "--", relPath) //nolint:gosec // argv is fixed; relPath is passed after --.
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git update-index --skip-worktree %s: %w%s", relPath, err, gitOutputSuffix(out))
+	}
+	return nil
+}
+
+func gitOutputSuffix(out []byte) string {
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" {
+		return ""
+	}
+	return ": " + trimmed
+}
+
 // ComputeRedirectTarget computes the expected redirect target for a worktree.
 // This is the canonical function for determining what a redirect should contain.
 // Both SetupRedirect and doctor checks should use this to stay in sync.
@@ -160,9 +233,24 @@ func cleanBeadsRuntimeFiles(beadsDir string) error {
 // Returns the redirect target path (e.g., "../../.beads" or "../../mayor/rig/.beads"),
 // or an error if the path is invalid or no beads location exists.
 func ComputeRedirectTarget(townRoot, worktreePath string) (string, error) {
+	townRootAbs, err := filepath.Abs(townRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolving town root: %w", err)
+	}
+	worktreeAbs, err := filepath.Abs(worktreePath)
+	if err != nil {
+		return "", fmt.Errorf("resolving worktree path: %w", err)
+	}
+	if worktreeAbs == townRootAbs {
+		return "", fmt.Errorf("cannot create redirect at town root")
+	}
+	if rel, err := filepath.Rel(townRootAbs, worktreeAbs); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("worktree path %s is outside town root %s", worktreePath, townRoot)
+	}
+
 	// Get rig root from worktree path
 	// worktreePath = <town>/<rig>/crew/<name> or <town>/<rig>/refinery/rig etc.
-	relPath, err := filepath.Rel(townRoot, worktreePath)
+	relPath, err := filepath.Rel(townRootAbs, worktreeAbs)
 	if err != nil {
 		return "", fmt.Errorf("computing relative path: %w", err)
 	}
@@ -180,17 +268,22 @@ func ComputeRedirectTarget(townRoot, worktreePath string) (string, error) {
 	}
 
 	rigName := parts[0]
-	rigRoot := filepath.Join(townRoot, rigName)
-	townBeadsPath := filepath.Join(townRoot, ".beads")
+	rigRoot := filepath.Join(townRootAbs, rigName)
+	townBeadsPath := filepath.Join(townRootAbs, ".beads")
 	rigBeadsPath := filepath.Join(rigRoot, ".beads")
 	mayorBeadsPath := filepath.Join(rigRoot, "mayor", "rig", ".beads")
 
 	// Check rig-level .beads first: if the rig has its own database
 	// (metadata.json with dolt_database), crew must use rig-level beads
 	// so they see the correct prefix (e.g., lc- for laneassist, not hq-).
+	// If the rig-level .beads is itself a redirect, flatten it here: bd does
+	// not support redirect chains and will ignore the worktree redirect.
 	if rigHasOwnDB(rigBeadsPath) {
 		depth := len(parts) - 1
 		upPath := strings.Repeat("../", depth)
+		if redirectPath, ok := directRigRedirectTarget(upPath, filepath.Join(rigBeadsPath, "redirect")); ok {
+			return redirectPath, nil
+		}
 		return upPath + ".beads", nil
 	}
 
@@ -266,23 +359,30 @@ func ComputeRedirectTarget(townRoot, worktreePath string) (string, error) {
 		// Check if rig-level beads has a redirect (tracked beads case).
 		// If so, redirect directly to the final destination to avoid chains.
 		// The bd CLI doesn't support redirect chains, so we must skip intermediate hops.
-		rigRedirectPath := filepath.Join(rigBeadsPath, "redirect")
-		if data, err := os.ReadFile(rigRedirectPath); err == nil {
-			rigRedirectTarget := strings.TrimSpace(string(data))
-			if rigRedirectTarget != "" {
-				if filepath.IsAbs(rigRedirectTarget) {
-					// Absolute redirect — pass through as-is (ResolveBeadsDir handles it)
-					redirectPath = rigRedirectTarget
-				} else {
-					// Relative redirect (e.g., "mayor/rig/.beads" for tracked beads).
-					// Redirect worktree directly to the final destination.
-					redirectPath = upPath + rigRedirectTarget
-				}
-			}
+		if target, ok := directRigRedirectTarget(upPath, filepath.Join(rigBeadsPath, "redirect")); ok {
+			redirectPath = target
 		}
 	}
 
 	return redirectPath, nil
+}
+
+func directRigRedirectTarget(upPath, rigRedirectPath string) (string, bool) {
+	data, err := os.ReadFile(rigRedirectPath) //nolint:gosec // G304: path is constructed internally
+	if err != nil {
+		return "", false
+	}
+	rigRedirectTarget := strings.TrimSpace(string(data))
+	if rigRedirectTarget == "" {
+		return "", false
+	}
+	if filepath.IsAbs(rigRedirectTarget) {
+		// Absolute redirect — pass through as-is (ResolveBeadsDir handles it).
+		return rigRedirectTarget, true
+	}
+	// Relative redirect (e.g., "mayor/rig/.beads" for tracked beads).
+	// Redirect worktree directly to the final destination.
+	return upPath + rigRedirectTarget, true
 }
 
 // SetupRedirect creates a .beads/redirect file for a worktree to point to the rig's shared beads.
@@ -322,13 +422,13 @@ func SetupRedirect(townRoot, worktreePath string) error {
 		}
 	}
 
-	// Clean up runtime files in .beads/ but preserve tracked files (formulas/, README.md, etc.)
+	// Clean up runtime/identity files in .beads/ but preserve tracked docs (formulas/, README.md, etc.)
 	worktreeBeadsDir := filepath.Join(worktreePath, ".beads")
 
-	// Handle edge case: if .beads exists as a file (not directory), remove it.
+	// Handle edge cases: if .beads exists as a file or symlink, remove that path.
 	// This can happen with stale state from previous failed operations or
 	// unusual clone state. MkdirAll would fail with "file exists" in this case.
-	if info, err := os.Stat(worktreeBeadsDir); err == nil && !info.IsDir() {
+	if info, err := os.Lstat(worktreeBeadsDir); err == nil && !info.IsDir() {
 		if err := os.Remove(worktreeBeadsDir); err != nil {
 			return fmt.Errorf("removing stale .beads file: %w", err)
 		}

@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 func captureConvoyStdoutErr(t *testing.T, fn func() error) (string, error) {
@@ -91,19 +93,27 @@ func TestRunConvoyList_UsesTownRootAndStripsBeadsDir(t *testing.T) {
 	t.Setenv("BEADS_DIR", "/wrong/.beads")
 
 	scriptBody := fmt.Sprintf(`
-if [ -n "$BEADS_DIR" ]; then
-  echo "BEADS_DIR leaked: $BEADS_DIR" >&2
+# Allow-stale version probe is exempt from BEADS_DIR check.
+if [ "$*" = "--allow-stale version" ]; then
+  exit 0
+fi
+
+if [ "$BEADS_DIR" != "%s/.beads" ]; then
+  echo "expected hardened BEADS_DIR, got $BEADS_DIR" >&2
   exit 1
 fi
 
 case "$*" in
-  "list --type=convoy --json --all --flat")
-    if [ "$PWD" != "%s" ]; then
-      echo "expected town root, got $PWD" >&2
-      exit 1
-    fi
-    echo '[{"id":"hq-cv-town","title":"Town convoy","status":"open","created_at":"2026-03-09T00:00:00Z"}]'
-    ;;
+	  "list --label=gt:convoy --json --limit=0 --all --flat")
+	    if [ "$PWD" != "%s" ]; then
+	      echo "expected town root, got $PWD" >&2
+	      exit 1
+	    fi
+	    echo '[{"id":"hq-cv-town","title":"Town convoy","status":"open","created_at":"2026-03-09T00:00:00Z","labels":["gt:convoy"]}]'
+	    ;;
+	  "list --json --limit=0 --all --flat")
+	    echo '[]'
+	    ;;
   "dep list hq-cv-town --direction=down --type=tracks --json")
     if [ "$PWD" != "%s" ]; then
       echo "expected town root, got $PWD" >&2
@@ -123,7 +133,7 @@ case "$*" in
     exit 1
     ;;
 esac
-`, expectedWD, expectedWD, expectedWD)
+`, expectedWD, expectedWD, expectedWD, expectedWD)
 	writeRoutingBdStub(t, scriptBody)
 
 	oldJSON, oldAll, oldStatus, oldTree := convoyListJSON, convoyListAll, convoyListStatus, convoyListTree
@@ -159,8 +169,13 @@ func TestRunConvoyStatus_UsesTownRootAndStripsBeadsDir(t *testing.T) {
 	t.Setenv("BEADS_DIR", "/wrong/.beads")
 
 	scriptBody := fmt.Sprintf(`
-if [ -n "$BEADS_DIR" ]; then
-  echo "BEADS_DIR leaked: $BEADS_DIR" >&2
+# Allow-stale version probe is exempt from BEADS_DIR check.
+if [ "$*" = "--allow-stale version" ]; then
+  exit 0
+fi
+
+if [ "$BEADS_DIR" != "%s/.beads" ]; then
+  echo "expected hardened BEADS_DIR, got $BEADS_DIR" >&2
   exit 1
 fi
 
@@ -184,7 +199,7 @@ case "$*" in
     exit 1
     ;;
 esac
-`, expectedWD, expectedWD)
+`, expectedWD, expectedWD, expectedWD)
 	writeRoutingBdStub(t, scriptBody)
 
 	oldJSON := convoyStatusJSON
@@ -199,5 +214,123 @@ esac
 	}
 	if !strings.Contains(out, "hq-cv-status") || !strings.Contains(out, "Progress:  0/0 completed") {
 		t.Fatalf("unexpected status output:\n%s", out)
+	}
+}
+
+// TestConvoyCreate_UsesTrackingHelper verifies convoy create delegates tracking
+// to the in-process helper instead of shelling out to `bd dep add`.
+func TestConvoyCreate_UsesTrackingHelper(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows - shell stubs")
+	}
+
+	townRoot, expectedWD := makeRoutingTownWorkspace(t)
+	chdirConvoyTest(t, townRoot)
+
+	// Write sentinel files to skip EnsureCustomTypes/Statuses (they call bd
+	// config set/get which isn't relevant to routing).
+	beadsDir := filepath.Join(townRoot, ".beads")
+	_ = os.WriteFile(filepath.Join(beadsDir, ".gt-types-configured"), []byte(beads.TypeConfigSentinelValue()), 0644)
+	_ = os.WriteFile(filepath.Join(beadsDir, ".gt-statuses-configured"), []byte("staged_ready,staged_warnings"), 0644)
+
+	var helperTownRoot, helperConvoyID, helperIssueID string
+	oldAddTracking := addTrackingRelationFn
+	addTrackingRelationFn = func(townRoot, convoyID, issueID string) error {
+		helperTownRoot = townRoot
+		helperConvoyID = convoyID
+		helperIssueID = issueID
+		return nil
+	}
+	t.Cleanup(func() { addTrackingRelationFn = oldAddTracking })
+
+	scriptBody := `
+case "$1" in
+  create)
+    echo '[{"id":"hq-cv-test"}]'
+    ;;
+  init|config)
+    exit 0
+    ;;
+  *)
+    echo '[]'
+    ;;
+esac
+`
+	writeRoutingBdStub(t, scriptBody)
+
+	// Override the entropy source for deterministic convoy IDs.
+	oldEntropy := convoyIDEntropy
+	convoyIDEntropy = strings.NewReader("abcde")
+	t.Cleanup(func() { convoyIDEntropy = oldEntropy })
+
+	_, err := captureConvoyStdoutErr(t, func() error {
+		return runConvoyCreate(nil, []string{"test-convoy", "mo-2sh.1"})
+	})
+	if err != nil {
+		t.Fatalf("runConvoyCreate: %v", err)
+	}
+
+	if helperTownRoot != expectedWD {
+		t.Errorf("tracking helper townRoot = %q, want %q", helperTownRoot, expectedWD)
+	}
+	if helperConvoyID != "hq-cv-pqrst" {
+		t.Errorf("tracking helper convoyID = %q, want %q", helperConvoyID, "hq-cv-pqrst")
+	}
+	if helperIssueID != "mo-2sh.1" {
+		t.Errorf("tracking helper issueID = %q, want %q", helperIssueID, "mo-2sh.1")
+	}
+}
+
+func TestConvoyAdd_UsesTrackingHelper(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows - shell stubs")
+	}
+
+	townRoot, expectedWD := makeRoutingTownWorkspace(t)
+	chdirConvoyTest(t, townRoot)
+
+	var helperTownRoot, helperConvoyID string
+	var helperIssues []string
+	oldAddTracking := addTrackingRelationFn
+	addTrackingRelationFn = func(townRoot, convoyID, issueID string) error {
+		helperTownRoot = townRoot
+		helperConvoyID = convoyID
+		helperIssues = append(helperIssues, issueID)
+		return nil
+	}
+	t.Cleanup(func() { addTrackingRelationFn = oldAddTracking })
+
+	scriptBody := fmt.Sprintf(`
+case "$*" in
+  "show hq-cv-test --json")
+    if [ "$PWD" != "%s" ]; then
+      echo "expected town root, got $PWD" >&2
+      exit 1
+    fi
+    echo '[{"id":"hq-cv-test","title":"Test Convoy","status":"open","issue_type":"convoy"}]'
+    ;;
+  *)
+    echo "unexpected bd args: $*" >&2
+    exit 1
+    ;;
+esac
+`, expectedWD)
+	writeRoutingBdStub(t, scriptBody)
+
+	_, err := captureConvoyStdoutErr(t, func() error {
+		return runConvoyAdd(nil, []string{"hq-cv-test", "ag-95s.1", "ag-95s.2"})
+	})
+	if err != nil {
+		t.Fatalf("runConvoyAdd: %v", err)
+	}
+
+	if helperTownRoot != expectedWD {
+		t.Errorf("tracking helper townRoot = %q, want %q", helperTownRoot, expectedWD)
+	}
+	if helperConvoyID != "hq-cv-test" {
+		t.Errorf("tracking helper convoyID = %q, want %q", helperConvoyID, "hq-cv-test")
+	}
+	if got := strings.Join(helperIssues, ","); got != "ag-95s.1,ag-95s.2" {
+		t.Errorf("tracking helper issues = %q, want %q", got, "ag-95s.1,ag-95s.2")
 	}
 }

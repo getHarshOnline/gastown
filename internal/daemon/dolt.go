@@ -12,9 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
+	agentconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
@@ -143,19 +143,19 @@ type DoltServerManager struct {
 	onRecoveryFn func()
 
 	// Test hooks (nil = use real implementations; set only in tests)
-	healthCheckFn      func() error
-	writeProbeCheckFn  func() error
-	identityCheckFn    func() error // nil = use real VerifyServerDataDir
-	startFn            func() error
-	runningFn          func() (int, bool)
-	stopFn             func()
-	sleepFn            func(time.Duration)
-	nowFn              func() time.Time
-	escalateFn         func(int)
-	unhealthyAlertFn   func(error)
-	readOnlyAlertFn    func(error)
-	crashAlertFn       func(int)
-	listDatabasesFn    func() ([]string, error)
+	healthCheckFn     func() error
+	writeProbeCheckFn func() error
+	identityCheckFn   func() error // nil = use real VerifyServerDataDir
+	startFn           func() error
+	runningFn         func() (int, bool)
+	stopFn            func()
+	sleepFn           func(time.Duration)
+	nowFn             func() time.Time
+	escalateFn        func(int)
+	unhealthyAlertFn  func(error)
+	readOnlyAlertFn   func(error)
+	crashAlertFn      func(int)
+	listDatabasesFn   func() ([]string, error)
 }
 
 // NewDoltServerManager creates a new Dolt server manager.
@@ -163,11 +163,26 @@ func NewDoltServerManager(townRoot string, config *DoltServerConfig, logger func
 	if config == nil {
 		config = DefaultDoltServerConfig(townRoot)
 	}
+	config = normalizeDoltServerConfig(townRoot, config)
 	return &DoltServerManager{
 		config:   config,
 		townRoot: townRoot,
 		logger:   logger,
 	}
+}
+
+func normalizeDoltServerConfig(townRoot string, config *DoltServerConfig) *DoltServerConfig {
+	if config == nil {
+		return nil
+	}
+	normalized := *config
+	if host, port, ok := agentconfig.ManagedDoltEndpoint(townRoot); ok {
+		normalized.Host = host
+		if port > 0 {
+			normalized.Port = port
+		}
+	}
+	return &normalized
 }
 
 // SetRecoveryCallback registers fn to be called (in a goroutine) whenever Dolt
@@ -219,48 +234,89 @@ func (m *DoltServerManager) isRemote() bool {
 	if m.config == nil {
 		return false
 	}
-	switch strings.ToLower(m.config.Host) {
+	host := strings.ToLower(m.config.Host)
+	switch host {
 	case "", "127.0.0.1", "localhost", "::1", "[::1]":
 		return false
+	}
+	// Resolve hostname and check if it points to loopback.
+	addrs, err := net.LookupHost(m.config.Host)
+	if err != nil {
+		return true
+	}
+	for _, addr := range addrs {
+		if ip := net.ParseIP(addr); ip != nil && ip.IsLoopback() {
+			return false
+		}
 	}
 	return true
 }
 
-// buildDoltSQLCmd constructs a dolt sql command using daemon config, mirroring
-// the doltserver.buildDoltSQLCmd pattern for local-vs-remote command construction.
+// buildDoltSQLCmd constructs a non-interactive dolt sql command that always
+// talks to the running SQL server over TCP.
+//
+// For local servers, this avoids embedded-mode auto-discovery, which can load
+// databases relative to cmd.Dir instead of querying the live shared server.
 func (m *DoltServerManager) buildDoltSQLCmd(ctx context.Context, args ...string) *exec.Cmd {
-	var fullArgs []string
-	fullArgs = append(fullArgs, "sql")
-
-	if m.isRemote() {
-		host := m.config.Host
-		if host == "" {
-			host = "127.0.0.1"
-		}
-		user := m.config.User
-		if user == "" {
-			user = "root"
-		}
-		fullArgs = append(fullArgs,
-			"--host", host,
-			"--port", strconv.Itoa(m.config.Port),
-			"--user", user,
-			"--no-tls",
-		)
+	host := m.config.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	user := m.config.User
+	if user == "" {
+		user = "root"
 	}
 
+	fullArgs := []string{
+		"--host", host,
+		"--port", strconv.Itoa(m.config.Port),
+		"--user", user,
+		"--no-tls",
+		"sql",
+	}
 	fullArgs = append(fullArgs, args...)
 	cmd := exec.CommandContext(ctx, "dolt", fullArgs...)
+	setSysProcAttr(cmd)
 
-	if !m.isRemote() {
-		cmd.Dir = m.config.DataDir
-	}
+	// Always set cmd.Dir to DataDir — even for remote connections (GH#2537).
+	// Without this, dolt auto-creates .doltcfg/privileges.db in $CWD,
+	// which accumulates stray privilege files that cause "multiple
+	// .doltcfg directories detected" or "Access denied" errors.
+	cmd.Dir = m.config.DataDir
 
-	if m.isRemote() && m.config.Password != "" {
-		cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD="+m.config.Password)
+	// Always set DOLT_CLI_PASSWORD when explicitly configured.
+	// For remote checks, preserve inherited credentials if config omits a
+	// password. For local checks, keep forcing the empty-password path so
+	// inherited shell credentials cannot make a healthy local server look broken.
+	// Strip any inherited DOLT_CLI_PASSWORD from os.Environ() first so the
+	// single canonical value we append wins unambiguously — duplicate keys in
+	// cmd.Env leak credentials into local checks (tests grep cmd.Env directly).
+	env := filterEnvKey(os.Environ(), "DOLT_CLI_PASSWORD")
+	if m.config.Password != "" {
+		cmd.Env = append(env, "DOLT_CLI_PASSWORD="+m.config.Password)
+	} else if m.isRemote() {
+		if inherited, ok := os.LookupEnv("DOLT_CLI_PASSWORD"); ok {
+			cmd.Env = append(env, "DOLT_CLI_PASSWORD="+inherited)
+		} else {
+			cmd.Env = append(env, "DOLT_CLI_PASSWORD=")
+		}
+	} else {
+		cmd.Env = append(env, "DOLT_CLI_PASSWORD=")
 	}
 
 	return cmd
+}
+
+// filterEnvKey returns env with all entries matching "<key>=..." removed.
+func filterEnvKey(env []string, key string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		if !strings.HasPrefix(e, prefix) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // HealthCheckInterval returns the configured health check interval,
@@ -386,9 +442,11 @@ func (m *DoltServerManager) EnsureRunning() error {
 		m.lastCheck = m.now()
 		if err := m.checkHealthLocked(); err != nil {
 			m.logger("Dolt server unhealthy: %v, restarting...", err)
-			m.sendUnhealthyAlert(err)
-			m.writeUnhealthySignal("health_check_failed", err.Error())
-			m.captureGoroutineDump()
+			if m.writeUnhealthySignal("health_check_failed", err.Error()) {
+				m.sendUnhealthyAlert(err)
+			} else {
+				m.logger("Dolt incident already active; suppressing duplicate unhealthy alert")
+			}
 			m.stopLocked()
 			return m.restartWithBackoff()
 		}
@@ -398,9 +456,11 @@ func (m *DoltServerManager) EnsureRunning() error {
 		// state that requires a server restart to clear.
 		if err := m.checkWriteHealthLocked(); err != nil {
 			m.logger("Dolt server read-only: %v, restarting...", err)
-			m.sendReadOnlyAlert(err)
-			m.writeUnhealthySignal("read_only", err.Error())
-			m.captureGoroutineDump()
+			if m.writeUnhealthySignal("read_only", err.Error()) {
+				m.sendReadOnlyAlert(err)
+			} else {
+				m.logger("Dolt incident already active; suppressing duplicate read-only alert")
+			}
 			m.stopLocked()
 			return m.restartWithBackoff()
 		}
@@ -412,9 +472,11 @@ func (m *DoltServerManager) EnsureRunning() error {
 			m.lastIdentityCheck = now
 			if err := m.checkDatabaseIdentityLocked(); err != nil {
 				m.logger("Dolt server identity check failed: %v, restarting...", err)
-				m.sendUnhealthyAlert(fmt.Errorf("identity check: %w", err))
-				m.writeUnhealthySignal("imposter_detected", err.Error())
-				m.captureGoroutineDump()
+				if m.writeUnhealthySignal("imposter_detected", err.Error()) {
+					m.sendUnhealthyAlert(fmt.Errorf("identity check: %w", err))
+				} else {
+					m.logger("Dolt incident already active; suppressing duplicate identity alert")
+				}
 				m.stopLocked()
 				// Also kill any imposters before restarting
 				if killErr := doltserver.KillImposters(m.townRoot); killErr != nil {
@@ -434,8 +496,11 @@ func (m *DoltServerManager) EnsureRunning() error {
 	// Not running, start it
 	if pid > 0 {
 		m.logger("Dolt server PID %d is dead, cleaning up and restarting...", pid)
-		m.sendCrashAlert(pid)
-		m.writeUnhealthySignal("server_dead", fmt.Sprintf("PID %d is dead", pid))
+		if m.writeUnhealthySignal("server_dead", fmt.Sprintf("PID %d is dead", pid)) {
+			m.sendCrashAlert(pid)
+		} else {
+			m.logger("Dolt incident already active; suppressing duplicate crash alert")
+		}
 	}
 	return m.restartWithBackoff()
 }
@@ -603,6 +668,7 @@ Action needed: Investigate and fix the root cause, then restart the daemon or th
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "gt", "mail", "send", "mayor/", "-s", subject, "-m", body) //nolint:gosec // G204: args are constructed internally
+		setSysProcAttr(cmd)
 		cmd.Dir = townRoot
 		cmd.Env = os.Environ()
 
@@ -682,6 +748,7 @@ func sendDoltAlertMail(townRoot, recipient, subject, body string, logger func(fo
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "gt", "mail", "send", recipient, "-s", subject, "-m", body) //nolint:gosec // G204: args are constructed internally
+	setSysProcAttr(cmd)
 	cmd.Dir = townRoot
 	cmd.Env = os.Environ()
 
@@ -725,12 +792,33 @@ func (m *DoltServerManager) unhealthySignalFile() string {
 
 // writeUnhealthySignal writes the DOLT_UNHEALTHY signal file.
 // This file signals to witness patrols that the Dolt server is degraded.
-func (m *DoltServerManager) writeUnhealthySignal(reason, detail string) {
+// It returns true only for the first write in an active incident. Existing
+// signal files are preserved so repeated health ticks do not reset the
+// incident timestamp or re-trigger diagnostics.
+func (m *DoltServerManager) writeUnhealthySignal(reason, detail string) bool {
+	signalFile := m.unhealthySignalFile()
 	payload := fmt.Sprintf(`{"reason":%q,"detail":%q,"timestamp":%q}`,
-		reason, detail, time.Now().UTC().Format(time.RFC3339))
-	if err := os.WriteFile(m.unhealthySignalFile(), []byte(payload), 0644); err != nil {
-		m.logger("Warning: failed to write DOLT_UNHEALTHY signal: %v", err)
+		reason, detail, m.now().UTC().Format(time.RFC3339))
+	f, err := os.OpenFile(signalFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if os.IsExist(err) {
+		return false
 	}
+	if err != nil {
+		m.logger("Warning: failed to write DOLT_UNHEALTHY signal: %v", err)
+		return true
+	}
+	if _, err := f.WriteString(payload); err != nil {
+		_ = f.Close()
+		_ = os.Remove(signalFile)
+		m.logger("Warning: failed to write DOLT_UNHEALTHY signal: %v", err)
+		return true
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(signalFile)
+		m.logger("Warning: failed to write DOLT_UNHEALTHY signal: %v", err)
+		return true
+	}
+	return true
 }
 
 // clearUnhealthySignal removes the DOLT_UNHEALTHY signal file when the server is healthy.
@@ -753,6 +841,66 @@ func (m *DoltServerManager) clearUnhealthySignal() {
 func IsDoltUnhealthy(townRoot string) bool {
 	_, err := os.Stat(filepath.Join(townRoot, "daemon", "DOLT_UNHEALTHY"))
 	return err == nil
+}
+
+// writeDaemonDoltConfig writes a Dolt config.yaml to configPath using the
+// daemon's DoltServerConfig. Unlike CLI flags, config.yaml can set
+// read_timeout_millis and write_timeout_millis, which prevents CLOSE_WAIT
+// accumulation when clients disconnect without completing their SQL sessions.
+func writeDaemonDoltConfig(cfg *DoltServerConfig, configPath string) error {
+	hostLine := ""
+	if cfg.Host != "" {
+		hostLine = fmt.Sprintf("\n  host: %s", cfg.Host)
+	}
+	eventSchedulerLine := "  event_scheduler: \"OFF\"\n"
+	if scheduler, ok := os.LookupEnv("GT_DOLT_EVENT_SCHEDULER"); ok {
+		if strings.EqualFold(scheduler, "omit") {
+			eventSchedulerLine = ""
+		} else if strings.TrimSpace(scheduler) != "" {
+			eventSchedulerLine = fmt.Sprintf("  event_scheduler: %q\n", strings.ToUpper(strings.TrimSpace(scheduler)))
+		}
+	}
+	systemVariablesBlock := "\nsystem_variables:\n  dolt_stats_enabled: 0\n"
+	if stats, ok := os.LookupEnv("GT_DOLT_STATS_ENABLED"); ok {
+		if strings.EqualFold(stats, "omit") {
+			systemVariablesBlock = ""
+		} else if strings.TrimSpace(stats) != "" {
+			systemVariablesBlock = fmt.Sprintf("\nsystem_variables:\n  dolt_stats_enabled: %s\n", strings.TrimSpace(stats))
+		}
+	}
+	// Non-blocking storage GC bounds the sql-server's RSS (hq-excy9g); on by
+	// default. GT_DOLT_AUTO_GC=off (or false/0/disabled) disables it at the next
+	// Dolt restart without a source revert+rebuild — the runtime escape hatch.
+	autoGcBlock := "  auto_gc_behavior:\n    enable: true\n    archive_level: 1\n"
+	if v, ok := os.LookupEnv("GT_DOLT_AUTO_GC"); ok {
+		if vv := strings.ToLower(strings.TrimSpace(v)); vv == "off" || vv == "false" || vv == "0" || vv == "disabled" {
+			autoGcBlock = "  auto_gc_behavior:\n    enable: false\n    archive_level: 0\n"
+		}
+	}
+	content := fmt.Sprintf(`# Dolt SQL server configuration — managed by Gas Town daemon
+# Do not edit manually; overwritten on each daemon-managed server start.
+
+log_level: info
+
+listener:
+  port: %d%s
+  read_timeout_millis: 30000
+  write_timeout_millis: 30000
+  max_connections: 1000
+
+data_dir: %q
+
+behavior:
+  dolt_transaction_commit: false
+%s%s%s`,
+		cfg.Port,
+		hostLine,
+		cfg.DataDir,
+		eventSchedulerLine,
+		autoGcBlock,
+		systemVariablesBlock,
+	)
+	return os.WriteFile(configPath, []byte(content), 0600)
 }
 
 // Start starts the Dolt SQL server.
@@ -787,12 +935,13 @@ func (m *DoltServerManager) startLocked() error {
 		return fmt.Errorf("dolt not found in PATH: %w", err)
 	}
 
-	// Build command arguments
-	args := []string{
-		"sql-server",
-		"--host", m.config.Host,
-		"--port", strconv.Itoa(m.config.Port),
-		"--data-dir", m.config.DataDir,
+	// Write config.yaml with timeouts before starting. CLI flags like --port
+	// silently override the config file but cannot set timeout fields, so we
+	// use --config instead. This prevents CLOSE_WAIT accumulation that occurs
+	// when Dolt uses its 8-hour default read/write timeouts. (gt-ch5)
+	configPath := filepath.Join(m.config.DataDir, "config.yaml")
+	if err := writeDaemonDoltConfig(m.config, configPath); err != nil {
+		m.logger("Warning: failed to write Dolt config.yaml: %v", err)
 	}
 
 	// Open log file
@@ -802,8 +951,7 @@ func (m *DoltServerManager) startLocked() error {
 	}
 
 	// Start dolt sql-server as background process
-	cmd := exec.Command(doltPath, args...)
-	cmd.Dir = m.config.DataDir
+	cmd := doltserver.NewSQLServerCommand(doltPath, m.config.DataDir, configPath)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
@@ -855,29 +1003,6 @@ func (m *DoltServerManager) Stop() error {
 }
 
 // stopLocked stops the Dolt server. Must be called with m.mu held.
-// captureGoroutineDump sends SIGQUIT to the Dolt server to dump goroutine stacks
-// to its log file. Per Tim Sehn (Dolt CEO): kill -QUIT prints all goroutine stacks
-// to stderr, which is redirected to the server log. Called before stopping an
-// unhealthy server so the dump captures what it was stuck on.
-func (m *DoltServerManager) captureGoroutineDump() {
-	pid, running := m.isRunning()
-	if !running {
-		return
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return
-	}
-	m.logger("Capturing goroutine dump from Dolt server (PID %d) before restart...", pid)
-	if err := process.Signal(syscall.SIGQUIT); err != nil {
-		m.logger("Warning: failed to send SIGQUIT for goroutine dump: %v", err)
-		return
-	}
-	// Give the server a moment to write the dump to its log file.
-	time.Sleep(500 * time.Millisecond)
-	m.logger("Goroutine dump written to server log. View with: gt dolt logs -n 200")
-}
-
 func (m *DoltServerManager) stopLocked() {
 	if m.stopFn != nil {
 		m.stopFn()
@@ -915,9 +1040,10 @@ func (m *DoltServerManager) stopLocked() {
 	select {
 	case <-done:
 		m.logger("Dolt SQL server stopped gracefully")
-	case <-time.After(5 * time.Second):
-		// Force kill
-		m.logger("Dolt SQL server did not stop gracefully, forcing termination")
+	case <-time.After(30 * time.Second):
+		// Force kill — 30s allows Dolt to flush its append-only journal under load.
+		// A SIGKILL mid-journal-write causes corruption requiring dolt fsck to recover.
+		m.logger("Dolt SQL server did not stop gracefully after 30s, forcing termination")
 		_ = sendKillSignal(process)
 	}
 
@@ -1360,6 +1486,7 @@ func (m *DoltServerManager) getDoltVersion() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "dolt", "version")
+	setSysProcAttr(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -1407,25 +1534,24 @@ func StopAllDoltServers(force bool) (int, int) {
 	}
 	before := len(pids)
 
-	sig := syscall.SIGTERM
-	if force {
-		sig = syscall.SIGKILL
-	}
-
 	for _, pid := range pids {
 		if p, err := os.FindProcess(pid); err == nil {
-			_ = p.Signal(sig)
+			if force {
+				_ = sendKillSignal(p)
+			} else {
+				_ = sendTermSignal(p)
+			}
 		}
 	}
 
 	if !force {
 		time.Sleep(2 * time.Second)
-		// Check if any survived, escalate to SIGKILL.
+		// Check if any survived, escalate to kill.
 		remaining := doltserver.FindAllDoltListeners()
 		if len(remaining) > 0 {
 			for _, l := range remaining {
 				if p, err := os.FindProcess(l.PID); err == nil {
-					_ = p.Signal(syscall.SIGKILL)
+					_ = sendKillSignal(p)
 				}
 			}
 		}

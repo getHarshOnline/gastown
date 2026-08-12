@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // Default parameters for feed-stranded rate limiting.
@@ -182,6 +184,8 @@ func (s *ConvoyFeedState) RecordFeed() {
 func FindStrandedConvoys(townRoot string) ([]StrandedConvoy, error) {
 	cmd := exec.Command("gt", "convoy", "stranded", "--json")
 	cmd.Dir = townRoot
+	cmd.Env = deaconReadOnlyRoutingEnv(townRoot)
+	util.SetDetachedProcessGroup(cmd)
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -335,6 +339,8 @@ func FeedStranded(townRoot string, maxPerCycle int, cooldown time.Duration) *Fee
 func closeEmptyConvoy(townRoot, convoyID string) error {
 	cmd := exec.Command("gt", "convoy", "check", convoyID)
 	cmd.Dir = townRoot
+	cmd.Env = deaconMutationRoutingEnv(townRoot)
+	util.SetDetachedProcessGroup(cmd)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -345,6 +351,8 @@ func dispatchFeedDog(townRoot, convoyID string) error {
 	cmd := exec.Command("gt", "sling", constants.MolConvoyFeed, "deacon/dogs",
 		"--var", fmt.Sprintf("convoy=%s", convoyID))
 	cmd.Dir = townRoot
+	cmd.Env = deaconMutationRoutingEnv(townRoot)
+	util.SetDetachedProcessGroup(cmd)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -378,8 +386,7 @@ func PruneFeedStrandedState(townRoot string) (int, error) {
 
 // getConvoyStatus returns the current status of a convoy bead.
 func getConvoyStatus(townRoot, convoyID string) string {
-	cmd := exec.Command("bd", "show", convoyID, "--json")
-	cmd.Dir = townRoot
+	cmd := beads.Command(townRoot, townBeadsDir(townRoot), beads.ReadOnlyRouting, "show", convoyID, "--json")
 
 	output, err := cmd.Output()
 	if err != nil {

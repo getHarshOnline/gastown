@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"log"
 	"path/filepath"
 	"time"
 
@@ -78,8 +79,8 @@ func (d *Daemon) handleDogsCleanupOnly() {
 	// Skip dispatchPlugins — under pressure
 }
 
-// cleanupStuckDogs finds dogs in state=working whose tmux session is dead and
-// clears their work so they return to idle.
+// cleanupStuckDogs finds dogs in state=working whose tmux session or agent
+// process is dead and clears their work so they return to idle.
 func (d *Daemon) cleanupStuckDogs(mgr *dog.Manager, sm *dog.SessionManager) {
 	dogs, err := mgr.List()
 	if err != nil {
@@ -87,26 +88,47 @@ func (d *Daemon) cleanupStuckDogs(mgr *dog.Manager, sm *dog.SessionManager) {
 		return
 	}
 
+	t := tmux.NewTmux()
 	for _, dg := range dogs {
 		if dg.State != dog.StateWorking {
 			continue
 		}
 
+		sessionID := sm.SessionName(dg.Name)
 		running, err := sm.IsRunning(dg.Name)
 		if err != nil {
 			d.logger.Printf("Handler: error checking session for dog %s: %v", dg.Name, err)
 			continue
 		}
 
-		if running {
+		if !running {
+			d.logger.Printf("Handler: dog %s is working but session is dead, clearing work", dg.Name)
+			d.clearDogWorkIfMatches(mgr, dg, "dead session")
 			continue
 		}
 
-		// Dog is marked working but session is dead — clean it up.
-		d.logger.Printf("Handler: dog %s is working but session is dead, clearing work", dg.Name)
-		if err := mgr.ClearWork(dg.Name); err != nil {
-			d.logger.Printf("Handler: failed to clear work for dog %s: %v", dg.Name, err)
+		status := t.CheckSessionHealth(sessionID, 0)
+		if status != tmux.AgentDead {
+			continue
 		}
+
+		d.logger.Printf("Handler: dog %s (%s) is working but agent is dead, killing session and clearing work", dg.Name, sessionID)
+		if err := t.KillSessionWithProcesses(sessionID); err != nil {
+			d.logger.Printf("Handler: failed to kill agent-dead session for dog %s (%s): %v", dg.Name, sessionID, err)
+			continue
+		}
+		d.clearDogWorkIfMatches(mgr, dg, "dead agent")
+	}
+}
+
+func (d *Daemon) clearDogWorkIfMatches(mgr *dog.Manager, dg *dog.Dog, reason string) {
+	cleared, err := mgr.ClearWorkIfMatches(dg.Name, dg.Work, dg.WorkStartedAt)
+	if err != nil {
+		d.logger.Printf("Handler: failed to clear work for dog %s (%s): %v", dg.Name, reason, err)
+		return
+	}
+	if !cleared {
+		d.logger.Printf("Handler: skipped clearing dog %s (%s): work assignment changed", dg.Name, reason)
 	}
 }
 
@@ -123,6 +145,7 @@ func (d *Daemon) detectStaleWorkingDogs(mgr *dog.Manager, sm *dog.SessionManager
 
 	threshold := daemonCfg.StaleWorkingTimeoutD()
 	now := time.Now()
+	t := tmux.NewTmux()
 	for _, dg := range dogs {
 		if dg.State != dog.StateWorking {
 			continue
@@ -136,22 +159,21 @@ func (d *Daemon) detectStaleWorkingDogs(mgr *dog.Manager, sm *dog.SessionManager
 		d.logger.Printf("Handler: dog %s stuck in working state (inactive %v, work: %s), clearing",
 			dg.Name, staleDuration.Truncate(time.Minute), dg.Work)
 
-		if err := mgr.ClearWork(dg.Name); err != nil {
-			d.logger.Printf("Handler: failed to clear work for stale dog %s: %v", dg.Name, err)
-			continue
-		}
-
-		// Kill the tmux session — it's not doing anything useful.
 		running, err := sm.IsRunning(dg.Name)
 		if err != nil {
 			d.logger.Printf("Handler: error checking session for stale dog %s: %v", dg.Name, err)
 			continue
 		}
 		if running {
-			if err := sm.Stop(dg.Name, true); err != nil {
+			// Kill the tmux session before clearing state so a failed kill does not
+			// return the dog to the idle pool with stale work still running.
+			if err := t.KillSessionWithProcesses(sm.SessionName(dg.Name)); err != nil {
 				d.logger.Printf("Handler: failed to stop session for stale dog %s: %v", dg.Name, err)
+				continue
 			}
 		}
+
+		d.clearDogWorkIfMatches(mgr, dg, "stale working")
 	}
 }
 
@@ -239,6 +261,12 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 	router := mail.NewRouterWithTownRoot(d.config.TownRoot, d.config.TownRoot)
 
 	for _, p := range plugins {
+		// Never auto-dispatch manual-gate plugins — they require an explicit trigger.
+		if p.Gate != nil && p.Gate.Type == plugin.GateManual {
+			d.logger.Printf("Handler: skipping plugin %s (gate=manual, requires explicit trigger)", p.Name)
+			continue
+		}
+
 		// Only dispatch plugins with cooldown gates.
 		if p.Gate == nil || p.Gate.Type != plugin.GateCooldown {
 			continue
@@ -256,14 +284,16 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 			}
 		}
 
-		// Find an idle dog.
-		idleDog, err := mgr.GetIdleDog()
-		if err != nil {
-			d.logger.Printf("Handler: error finding idle dog: %v", err)
-			return // No point continuing if we can't list dogs
-		}
+		// Find an idle dog that doesn't already have a live tmux session.
+		// A leaked session (dog marked idle before its tmux terminated) would
+		// cause sm.Start to fail with "session already running", and since
+		// mgr.List() returns dogs in directory order, GetIdleDog would always
+		// pick the same first idle dog — infinite-looping the same failed
+		// dispatch instead of advancing to the next idle dog in the pack.
+		// See gt-o24.
+		idleDog := findDispatchableDog(mgr, sm, d.logger)
 		if idleDog == nil {
-			d.logger.Printf("Handler: no idle dogs available, deferring remaining plugins")
+			d.logger.Printf("Handler: no dispatchable idle dogs available, deferring remaining plugins")
 			return
 		}
 
@@ -271,6 +301,25 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 		workDesc := fmt.Sprintf("plugin:%s", p.Name)
 		if err := mgr.AssignWork(idleDog.Name, workDesc); err != nil {
 			d.logger.Printf("Handler: failed to assign work to dog %s: %v", idleDog.Name, err)
+			continue
+		}
+
+		// Send mail with plugin instructions BEFORE starting the session
+		// so the dog finds work in its inbox on first check.
+		msg := mail.NewMessage(
+			"daemon",
+			fmt.Sprintf("deacon/dogs/%s", idleDog.Name),
+			fmt.Sprintf("Plugin: %s", p.Name),
+			p.FormatMailBody(),
+		)
+		msg.Type = mail.TypeTask
+		msg.Timestamp = time.Now()
+		if err := router.Send(msg); err != nil {
+			d.logger.Printf("Handler: failed to send mail to dog %s: %v", idleDog.Name, err)
+			// Roll back assignment — no point starting a session without instructions.
+			if clearErr := mgr.ClearWork(idleDog.Name); clearErr != nil {
+				d.logger.Printf("Handler: failed to clear work after mail failure for dog %s: %v", idleDog.Name, clearErr)
+			}
 			continue
 		}
 
@@ -285,22 +334,55 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 			continue
 		}
 
-		// Send mail with plugin instructions.
-		msg := mail.NewMessage(
-			"daemon",
-			fmt.Sprintf("deacon/dogs/%s", idleDog.Name),
-			fmt.Sprintf("Plugin: %s", p.Name),
-			p.FormatMailBody(),
-		)
-		msg.Type = mail.TypeTask
-		msg.Timestamp = time.Now()
-		if err := router.Send(msg); err != nil {
-			d.logger.Printf("Handler: failed to send mail to dog %s: %v", idleDog.Name, err)
-			// Session is already started — dog will find no mail and idle out.
-		}
-
 		d.logger.Printf("Handler: dispatched plugin %s to dog %s", p.Name, idleDog.Name)
+
+		// Record the dispatch immediately so the cooldown gate is satisfied
+		// for the next 1h regardless of what the dog does. Dogs create their
+		// own completion beads but don't reliably use the label convention the
+		// gate requires, causing infinite re-dispatch loops.
+		if _, err := recorder.RecordRun(plugin.PluginRunRecord{
+			PluginName: p.Name,
+			Result:     plugin.ResultSuccess,
+			Body:       fmt.Sprintf("Dispatched to dog %s", idleDog.Name),
+		}); err != nil {
+			d.logger.Printf("Handler: failed to record dispatch for plugin %s: %v", p.Name, err)
+		}
 	}
+}
+
+// findDispatchableDog returns the first dog in the kennel whose registry
+// state is idle AND whose tmux session is NOT currently running. Returns nil
+// when no dog satisfies both conditions.
+//
+// This exists because a dog can be marked idle (via gt dog done or the reaper)
+// before its tmux session fully terminates, producing a transient window where
+// sm.Start would fail with "session already running". Picking that dog every
+// dispatch tick infinite-loops the same failed dispatch instead of advancing
+// to another genuinely-free dog in the pack. See gt-o24.
+//
+// IsRunning errors are logged and treated as "not dispatchable" so a flaky
+// tmux check can't wedge the whole dispatch cycle.
+func findDispatchableDog(mgr *dog.Manager, sm *dog.SessionManager, logger *log.Logger) *dog.Dog {
+	dogs, err := mgr.List()
+	if err != nil {
+		logger.Printf("Handler: failed to list dogs while picking dispatch target: %v", err)
+		return nil
+	}
+	for _, d := range dogs {
+		if d.State != dog.StateIdle {
+			continue
+		}
+		running, err := sm.IsRunning(d.Name)
+		if err != nil {
+			logger.Printf("Handler: IsRunning check failed for dog %s: %v; skipping", d.Name, err)
+			continue
+		}
+		if running {
+			continue
+		}
+		return d
+	}
+	return nil
 }
 
 // loadRigsConfig loads the rigs configuration from mayor/rigs.json.

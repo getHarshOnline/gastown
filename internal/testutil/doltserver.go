@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql" // required by testcontainers Dolt module
 	"github.com/testcontainers/testcontainers-go"
@@ -18,15 +20,15 @@ import (
 // DoltDockerImage is the Docker image used for Dolt test containers.
 // DOLT_ROOT_HOST=% tells the entrypoint to create root@'%' (available
 // since Dolt 1.46.0), which lets testcontainers connect via TCP.
-const DoltDockerImage = "dolthub/dolt-sql-server:1.83.0"
+const DoltDockerImage = "dolthub/dolt-sql-server:2.0.7"
 
 var (
-	doltCtr      *dolt.DoltContainer
-	doltCtrOnce  sync.Once
-	doltCtrErr   error
-	doltCtrPort  string
-	dockerOnce   sync.Once
-	dockerAvail  bool
+	doltCtr     *dolt.DoltContainer
+	doltCtrOnce sync.Once
+	doltCtrErr  error
+	doltCtrPort string
+	dockerOnce  sync.Once
+	dockerAvail bool
 )
 
 // isDockerAvailable returns true if the Docker daemon is reachable.
@@ -38,14 +40,65 @@ func isDockerAvailable() bool {
 	return dockerAvail
 }
 
+// isReaperRemovingErr returns true if the error is a transient "removing"
+// status from the testcontainers Ryuk reaper. This happens when a previous
+// test run's reaper container is still being cleaned up by Docker.
+func isReaperRemovingErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "unexpected container status") &&
+		strings.Contains(err.Error(), "removing")
+}
+
+func isDockerUnavailableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "rootless docker not found") ||
+		strings.Contains(msg, "cannot connect to the docker daemon") ||
+		strings.Contains(msg, "no docker host")
+}
+
+func runDoltContainer(ctx context.Context) (ctr *dolt.DoltContainer, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("testcontainers docker unavailable: %v", r)
+		}
+	}()
+
+	return dolt.Run(ctx, DoltDockerImage,
+		dolt.WithDatabase("gt_test"),
+		testcontainers.WithEnv(map[string]string{"DOLT_ROOT_HOST": "%"}),
+	)
+}
+
+// runDoltContainerWithRetry calls dolt.Run, retrying on transient reaper
+// "removing" errors up to 3 times with exponential backoff.
+func runDoltContainerWithRetry(ctx context.Context) (*dolt.DoltContainer, error) {
+	const maxRetries = 3
+	delay := 2 * time.Second
+	var lastErr error
+	for attempt := range maxRetries {
+		ctr, err := runDoltContainer(ctx)
+		if err == nil {
+			return ctr, nil
+		}
+		lastErr = err
+		if !isReaperRemovingErr(err) {
+			return nil, err
+		}
+		if attempt < maxRetries-1 {
+			time.Sleep(delay)
+			delay *= 2
+		}
+	}
+	return nil, lastErr
+}
+
 // startSharedDoltContainer starts the shared Dolt container and sets
 // GT_DOLT_PORT and BEADS_DOLT_PORT process-wide.
 func startSharedDoltContainer() {
 	ctx := context.Background()
-	ctr, err := dolt.Run(ctx, DoltDockerImage,
-		dolt.WithDatabase("gt_test"),
-		testcontainers.WithEnv(map[string]string{"DOLT_ROOT_HOST": "%"}),
-	)
+	ctr, err := runDoltContainerWithRetry(ctx)
 	if err != nil {
 		doltCtrErr = fmt.Errorf("starting Dolt container: %w", err)
 		return
@@ -62,6 +115,7 @@ func startSharedDoltContainer() {
 	doltCtrPort = p.Port()
 	os.Setenv("GT_DOLT_PORT", doltCtrPort)    //nolint:tenv // intentional process-wide env
 	os.Setenv("BEADS_DOLT_PORT", doltCtrPort) //nolint:tenv // intentional process-wide env
+	os.Setenv("GT_TEST_EXTERNAL_DOLT", "1")   //nolint:tenv // integration tests reuse this container
 }
 
 // StartIsolatedDoltContainer starts a per-test Dolt container and returns the
@@ -74,11 +128,11 @@ func StartIsolatedDoltContainer(t *testing.T) string {
 	}
 
 	ctx := context.Background()
-	ctr, err := dolt.Run(ctx, DoltDockerImage,
-		dolt.WithDatabase("gt_test"),
-		testcontainers.WithEnv(map[string]string{"DOLT_ROOT_HOST": "%"}),
-	)
+	ctr, err := runDoltContainerWithRetry(ctx)
 	if err != nil {
+		if isDockerUnavailableErr(err) {
+			t.Skipf("Dolt container unavailable: %v", err)
+		}
 		t.Fatalf("starting Dolt container: %v", err)
 	}
 	t.Cleanup(func() {
@@ -119,6 +173,9 @@ func RequireDoltContainer(t *testing.T) {
 
 	doltCtrOnce.Do(startSharedDoltContainer)
 	if doltCtrErr != nil {
+		if isDockerUnavailableErr(doltCtrErr) {
+			t.Skipf("Dolt container unavailable: %v", doltCtrErr)
+		}
 		t.Fatalf("Dolt container setup failed: %v", doltCtrErr)
 	}
 }

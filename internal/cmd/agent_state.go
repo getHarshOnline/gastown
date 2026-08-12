@@ -2,12 +2,14 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -35,18 +37,18 @@ Labels are stored as key:value pairs (e.g., idle:3, backoff:2m).
 
 OPERATIONS:
   Get all labels (default):
-    gt agent state <agent-bead>
+    gt agents state <agent-bead>
 
   Set a label:
-    gt agent state <agent-bead> --set idle=0
-    gt agent state <agent-bead> --set idle=0 --set backoff=30s
+    gt agents state <agent-bead> --set idle=0
+    gt agents state <agent-bead> --set idle=0 --set backoff=30s
 
   Increment a numeric label:
-    gt agent state <agent-bead> --incr idle
+    gt agents state <agent-bead> --incr idle
     (Creates label with value 1 if not present)
 
   Delete a label:
-    gt agent state <agent-bead> --del idle
+    gt agents state <agent-bead> --del idle
 
 COMMON LABELS:
   idle:<n>           - Consecutive idle patrol cycles
@@ -55,16 +57,16 @@ COMMON LABELS:
 
 EXAMPLES:
   # Check current idle count
-  gt agent state gt-gastown-witness
+  gt agents state gt-gastown-witness
 
   # Reset idle counter after finding work
-  gt agent state gt-gastown-witness --set idle=0
+  gt agents state gt-gastown-witness --set idle=0
 
   # Increment idle counter on timeout
-  gt agent state gt-gastown-witness --incr idle
+  gt agents state gt-gastown-witness --incr idle
 
   # Get state as JSON
-  gt agent state gt-gastown-witness --json`,
+  gt agents state gt-gastown-witness --json`,
 	Args: cobra.ExactArgs(1),
 	RunE: runAgentState,
 }
@@ -92,15 +94,9 @@ type agentStateResult struct {
 func runAgentState(cmd *cobra.Command, args []string) error {
 	agentBead := args[0]
 
-	// Find beads directory
-	cwd, err := os.Getwd()
+	beadsDir, err := resolveAgentTrackingBeadsDir()
 	if err != nil {
-		return fmt.Errorf("getting working directory: %w", err)
-	}
-
-	beadsDir := beads.ResolveBeadsDir(cwd)
-	if beadsDir == "" {
-		return fmt.Errorf("not in a beads workspace")
+		return fmt.Errorf("not in a beads workspace: %w", err)
 	}
 
 	// Determine operation mode
@@ -216,9 +212,10 @@ func modifyAgentState(agentBead, beadsDir string, hasIncr bool) error {
 		args = append(args, "--set-labels=")
 	}
 
-	// Execute bd update
-	cmd := exec.Command("bd", args...)
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	ctx, cancel := context.WithTimeout(context.Background(), bdCallTimeout)
+	defer cancel()
+
+	cmd := beads.CommandContext(ctx, filepath.Dir(beadsDir), beadsDir, beads.MutationPinned, args...)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -257,12 +254,20 @@ func getAgentLabels(agentBead, beadsDir string) (map[string]string, error) {
 	return labels, nil
 }
 
+// bdCallTimeout is the per-call timeout for bd subprocess invocations in agent-bead
+// helpers. bd commands should be fast against a local Dolt server, but can hang
+// indefinitely if Dolt is unresponsive (e.g., connection pool exhausted). A 30s
+// ceiling prevents await-event/await-signal from stalling past the patrol timeout.
+const bdCallTimeout = 30 * time.Second
+
 // getAllAgentLabels retrieves all labels (including non-state) from an agent bead.
 func getAllAgentLabels(agentBead, beadsDir string) ([]string, error) {
 	args := []string{"show", agentBead, "--json"}
 
-	cmd := exec.Command("bd", args...)
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	ctx, cancel := context.WithTimeout(context.Background(), bdCallTimeout)
+	defer cancel()
+
+	cmd := beads.CommandContext(ctx, filepath.Dir(beadsDir), beadsDir, beads.ReadOnlyPinned, args...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

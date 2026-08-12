@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -456,6 +458,104 @@ func TestLoadRigSettingsNotFound(t *testing.T) {
 	}
 }
 
+func TestLoadRepoSettings(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns nil when file missing", func(t *testing.T) {
+		t.Parallel()
+		settings, err := LoadRepoSettings("/nonexistent/repo")
+		if err != nil {
+			t.Fatalf("expected nil error, got: %v", err)
+		}
+		if settings != nil {
+			t.Fatal("expected nil settings for missing file")
+		}
+	})
+
+	t.Run("loads valid repo settings", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		gsDir := filepath.Join(dir, ".gastown")
+		if err := os.MkdirAll(gsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		data := []byte(`{
+			"type": "rig-settings",
+			"version": 1,
+			"merge_queue": {
+				"test_command": "./scripts/ci/api.sh",
+				"build_command": "dotnet build"
+			}
+		}`)
+		if err := os.WriteFile(filepath.Join(gsDir, "settings.json"), data, 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		settings, err := LoadRepoSettings(dir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if settings == nil {
+			t.Fatal("expected non-nil settings")
+		}
+		if settings.MergeQueue == nil {
+			t.Fatal("expected non-nil MergeQueue")
+		}
+		if settings.MergeQueue.TestCommand != "./scripts/ci/api.sh" {
+			t.Errorf("expected test_command='./scripts/ci/api.sh', got %q", settings.MergeQueue.TestCommand)
+		}
+		if settings.MergeQueue.BuildCommand != "dotnet build" {
+			t.Errorf("expected build_command='dotnet build', got %q", settings.MergeQueue.BuildCommand)
+		}
+	})
+}
+
+func TestMergeSettingsCommand(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil inputs returns nil", func(t *testing.T) {
+		t.Parallel()
+		result := MergeSettingsCommand(nil, nil)
+		if result != nil {
+			t.Fatal("expected nil")
+		}
+	})
+
+	t.Run("repo only", func(t *testing.T) {
+		t.Parallel()
+		repo := &MergeQueueConfig{TestCommand: "repo-test", BuildCommand: "repo-build"}
+		result := MergeSettingsCommand(repo, nil)
+		if result.TestCommand != "repo-test" {
+			t.Errorf("expected 'repo-test', got %q", result.TestCommand)
+		}
+	})
+
+	t.Run("local overrides repo", func(t *testing.T) {
+		t.Parallel()
+		repo := &MergeQueueConfig{TestCommand: "repo-test", BuildCommand: "repo-build", LintCommand: "repo-lint"}
+		local := &MergeQueueConfig{TestCommand: "local-test"}
+		result := MergeSettingsCommand(repo, local)
+		if result.TestCommand != "local-test" {
+			t.Errorf("expected 'local-test', got %q", result.TestCommand)
+		}
+		if result.BuildCommand != "repo-build" {
+			t.Errorf("expected 'repo-build' (not overridden), got %q", result.BuildCommand)
+		}
+		if result.LintCommand != "repo-lint" {
+			t.Errorf("expected 'repo-lint' (not overridden), got %q", result.LintCommand)
+		}
+	})
+
+	t.Run("local only", func(t *testing.T) {
+		t.Parallel()
+		local := &MergeQueueConfig{TestCommand: "local-test"}
+		result := MergeSettingsCommand(nil, local)
+		if result.TestCommand != "local-test" {
+			t.Errorf("expected 'local-test', got %q", result.TestCommand)
+		}
+	})
+}
+
 func TestMayorConfigRoundTrip(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -463,6 +563,12 @@ func TestMayorConfigRoundTrip(t *testing.T) {
 
 	original := NewMayorConfig()
 	original.Theme = &TownThemeConfig{
+		Disabled: true,
+		Name:     "forest",
+		Custom: &CustomTheme{
+			BG: "#111111",
+			FG: "#eeeeee",
+		},
 		RoleDefaults: map[string]string{
 			"witness": "rust",
 		},
@@ -485,6 +591,15 @@ func TestMayorConfigRoundTrip(t *testing.T) {
 	}
 	if loaded.Theme == nil || loaded.Theme.RoleDefaults["witness"] != "rust" {
 		t.Error("Theme.RoleDefaults not preserved")
+	}
+	if loaded.Theme == nil || !loaded.Theme.Disabled {
+		t.Error("Theme.Disabled not preserved")
+	}
+	if loaded.Theme == nil || loaded.Theme.Name != "forest" {
+		t.Error("Theme.Name not preserved")
+	}
+	if loaded.Theme == nil || loaded.Theme.Custom == nil || loaded.Theme.Custom.BG != "#111111" || loaded.Theme.Custom.FG != "#eeeeee" {
+		t.Error("Theme.Custom not preserved")
 	}
 }
 
@@ -1092,7 +1207,8 @@ func TestBuildCrewStartupCommand(t *testing.T) {
 }
 
 func TestResolveAgentConfigWithOverride(t *testing.T) {
-	t.Parallel()
+	ResetRegistryForTesting()
+	t.Cleanup(ResetRegistryForTesting)
 	townRoot := t.TempDir()
 	rigPath := filepath.Join(townRoot, "testrig")
 
@@ -1373,6 +1489,72 @@ func TestBuildStartupCommand_UsesRigAgentWhenRigPathProvided(t *testing.T) {
 	}
 	if strings.Contains(cmd, "gemini --approval-mode yolo") {
 		t.Fatalf("did not expect town default agent in command: %q", cmd)
+	}
+}
+
+func TestBuildStartupCommand_ClearsBDTargetSelectors(t *testing.T) {
+	binDir := t.TempDir()
+	writeAgentStub(t, binDir, "agent")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	townSettings := NewTownSettings()
+	townSettings.RoleAgents = map[string]string{constants.RoleWitness: "target-cleaner"}
+	townSettings.Agents["target-cleaner"] = &RuntimeConfig{
+		Command: "agent",
+		Env: map[string]string{
+			"BEADS_DIR":                  "/agent/beads",
+			"BEADS_DOLT_DATA_DIR":        "/agent/data",
+			"BEADS_DOLT_SERVER_DATABASE": "agentdb",
+			"BEADS_DOLT_SERVER_SOCKET":   "/agent/socket",
+			"GT_DOLT_DATA":               "/agent/data",
+			"GT_DOLT_PORT":               "1555",
+			"GT_DOLT_HOST":               "agent-host",
+			"BEADS_DOLT_PORT":            "1555",
+			"BEADS_DOLT_SERVER_PORT":     "1555",
+			"BEADS_DOLT_SERVER_HOST":     "agent-host",
+			"BEADS_DOLT_AUTO_START":      "0",
+		},
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd := BuildStartupCommand(map[string]string{
+		"GT_ROLE":                    constants.RoleWitness,
+		"BEADS_DIR":                  "/caller/beads",
+		"BEADS_DOLT_DATA_DIR":        "/caller/data",
+		"BEADS_DOLT_SERVER_DATABASE": "callerdb",
+		"GT_DOLT_DATA":               "/caller/data",
+		"GT_DOLT_PORT":               "1444",
+		"GT_DOLT_HOST":               "caller-host",
+	}, rigPath, "")
+
+	for _, key := range bdTargetSelectorEnvVars {
+		if !strings.Contains(cmd, key+"=") {
+			t.Fatalf("startup command missing cleared %s assignment: %q", key, cmd)
+		}
+	}
+	for _, stale := range []string{"/caller", "/agent", "callerdb", "agentdb"} {
+		if strings.Contains(cmd, stale) {
+			t.Fatalf("startup command leaked stale bd selector value %q: %q", stale, cmd)
+		}
+	}
+	for _, want := range []string{
+		"GT_DOLT_PORT=1555",
+		"GT_DOLT_HOST=agent-host",
+		"BEADS_DOLT_PORT=1555",
+		"BEADS_DOLT_SERVER_PORT=1555",
+		"BEADS_DOLT_SERVER_HOST=agent-host",
+		"BEADS_DOLT_AUTO_START=0",
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Fatalf("startup command missing preserved connection env %q: %q", want, cmd)
+		}
 	}
 }
 
@@ -2846,7 +3028,7 @@ func TestFillRuntimeDefaults(t *testing.T) {
 			Provider:      "codex",
 			Command:       "opencode",
 			Args:          []string{"-m", "gpt-5"},
-			Env:           map[string]string{"OPENCODE_PERMISSION": `{"*":"allow"}`},
+			Env:           map[string]string{"OPENCODE_PERMISSION": `{"*":"allow"}`, "OPENCODE_CONFIG_CONTENT": `{"lsp":false}`},
 			InitialPrompt: "test prompt",
 			PromptMode:    "none",
 			ResolvedAgent: "opencode",
@@ -2877,6 +3059,9 @@ func TestFillRuntimeDefaults(t *testing.T) {
 		}
 		if result.Env["OPENCODE_PERMISSION"] != input.Env["OPENCODE_PERMISSION"] {
 			t.Errorf("Env: got %v, want %v", result.Env, input.Env)
+		}
+		if result.Env["OPENCODE_CONFIG_CONTENT"] != input.Env["OPENCODE_CONFIG_CONTENT"] {
+			t.Errorf("OPENCODE_CONFIG_CONTENT was not preserved: got %v, want %v", result.Env, input.Env)
 		}
 		if result.InitialPrompt != input.InitialPrompt {
 			t.Errorf("InitialPrompt: got %q, want %q", result.InitialPrompt, input.InitialPrompt)
@@ -3114,7 +3299,7 @@ func TestFillRuntimeDefaults(t *testing.T) {
 		}
 	})
 
-	t.Run("nil nested structs remain nil except auto-filled Hooks", func(t *testing.T) {
+	t.Run("nil nested structs are auto-filled from preset for known agents", func(t *testing.T) {
 		t.Parallel()
 		input := &RuntimeConfig{
 			Command: "claude",
@@ -3123,22 +3308,30 @@ func TestFillRuntimeDefaults(t *testing.T) {
 
 		result := fillRuntimeDefaults(input)
 
-		// Nil nested structs should remain nil (not get zero-value structs)
-		if result.Session != nil {
-			t.Error("Session should remain nil when input has nil Session")
-		}
 		// Hooks is auto-filled for known agents (claude, opencode) to ensure
-		// EnsureSettingsForRole creates the correct settings files
+		// EnsureSettingsForRole creates the correct settings files.
 		if result.Hooks == nil {
 			t.Error("Hooks should be auto-filled for claude command")
 		} else if result.Hooks.Provider != "claude" {
 			t.Errorf("Hooks.Provider = %q, want %q", result.Hooks.Provider, "claude")
 		}
-		if result.Tmux != nil {
-			t.Error("Tmux should remain nil when input has nil Tmux")
+		// Session is auto-filled from preset so handoffs can propagate GT_SESSION_ID_ENV.
+		if result.Session == nil {
+			t.Error("Session should be auto-filled for claude command")
+		} else if result.Session.SessionIDEnv != "CLAUDE_SESSION_ID" {
+			t.Errorf("Session.SessionIDEnv = %q, want CLAUDE_SESSION_ID", result.Session.SessionIDEnv)
 		}
-		if result.Instructions != nil {
-			t.Error("Instructions should remain nil when input has nil Instructions")
+		// Tmux is auto-filled from preset so WaitForRuntimeReady uses prompt detection.
+		if result.Tmux == nil {
+			t.Error("Tmux should be auto-filled for claude command")
+		} else if result.Tmux.ReadyPromptPrefix != "❯ " {
+			t.Errorf("Tmux.ReadyPromptPrefix = %q, want \"❯ \"", result.Tmux.ReadyPromptPrefix)
+		}
+		// Instructions is auto-filled from preset when nil.
+		if result.Instructions == nil {
+			t.Error("Instructions should be auto-filled for claude command")
+		} else if result.Instructions.File != "CLAUDE.md" {
+			t.Errorf("Instructions.File = %q, want CLAUDE.md", result.Instructions.File)
 		}
 	})
 
@@ -3200,11 +3393,11 @@ func TestFillRuntimeDefaults(t *testing.T) {
 				t.Errorf("Tmux.ProcessNames[%d] = %q, want %q", i, result.Tmux.ProcessNames[i], want)
 			}
 		}
-		if result.Tmux.ReadyDelayMs != 3000 {
-			t.Errorf("Tmux.ReadyDelayMs = %d, want 3000", result.Tmux.ReadyDelayMs)
+		if result.Tmux.ReadyDelayMs != 8000 {
+			t.Errorf("Tmux.ReadyDelayMs = %d, want 8000", result.Tmux.ReadyDelayMs)
 		}
 
-		// PromptMode should default to "arg" for pi
+		// PromptMode should be "arg" for pi (from preset)
 		if result.PromptMode != "arg" {
 			t.Errorf("PromptMode = %q, want arg", result.PromptMode)
 		}
@@ -3249,6 +3442,177 @@ func TestFillRuntimeDefaults(t *testing.T) {
 			t.Errorf("Tmux.ReadyDelayMs = %d, want 5000 (user-specified)", result.Tmux.ReadyDelayMs)
 		}
 	})
+
+	t.Run("custom claude agent inherits Session and Tmux from preset", func(t *testing.T) {
+		t.Parallel()
+		// Simulates: gt config agent set claude-opus 'claude --model claude-opus-4-6'
+		input := &RuntimeConfig{
+			Command: "claude",
+			Args:    []string{"--dangerously-skip-permissions", "--model", "claude-opus-4-6"},
+		}
+
+		result := fillRuntimeDefaults(input)
+
+		if result.Session == nil {
+			t.Fatal("Session should be auto-filled for claude command")
+		}
+		if result.Session.SessionIDEnv != "CLAUDE_SESSION_ID" {
+			t.Errorf("Session.SessionIDEnv = %q, want CLAUDE_SESSION_ID", result.Session.SessionIDEnv)
+		}
+		if result.Tmux == nil {
+			t.Fatal("Tmux should be auto-filled for claude command")
+		}
+		if result.Tmux.ReadyPromptPrefix != "❯ " {
+			t.Errorf("Tmux.ReadyPromptPrefix = %q, want \"❯ \"", result.Tmux.ReadyPromptPrefix)
+		}
+		found := false
+		for _, n := range result.Tmux.ProcessNames {
+			if n == "claude" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Tmux.ProcessNames = %v, want to contain \"claude\"", result.Tmux.ProcessNames)
+		}
+		if len(result.Args) < 2 || result.Args[len(result.Args)-1] != "claude-opus-4-6" {
+			t.Errorf("Args should be preserved: got %v", result.Args)
+		}
+	})
+
+	t.Run("explicit Session config is not overridden by preset", func(t *testing.T) {
+		t.Parallel()
+		input := &RuntimeConfig{
+			Command: "claude",
+			Session: &RuntimeSessionConfig{
+				SessionIDEnv: "MY_CUSTOM_SESSION_ID",
+			},
+		}
+
+		result := fillRuntimeDefaults(input)
+
+		if result.Session.SessionIDEnv != "MY_CUSTOM_SESSION_ID" {
+			t.Errorf("Session.SessionIDEnv = %q, want MY_CUSTOM_SESSION_ID (user-specified)", result.Session.SessionIDEnv)
+		}
+	})
+
+	t.Run("explicit Tmux config is not overridden by preset", func(t *testing.T) {
+		t.Parallel()
+		input := &RuntimeConfig{
+			Command: "claude",
+			Tmux: &RuntimeTmuxConfig{
+				ProcessNames: []string{"my-claude-wrapper"},
+			},
+		}
+
+		result := fillRuntimeDefaults(input)
+
+		if len(result.Tmux.ProcessNames) != 1 || result.Tmux.ProcessNames[0] != "my-claude-wrapper" {
+			t.Errorf("Tmux.ProcessNames = %v, want [my-claude-wrapper] (user-specified)", result.Tmux.ProcessNames)
+		}
+	})
+}
+
+// TestFillRuntimeDefaultsPresetMerging verifies preset defaults are merged
+// into custom agent configs based on the Provider field or inferred command name.
+func TestFillRuntimeDefaultsPresetMerging(t *testing.T) {
+	t.Parallel()
+
+	t.Run("custom agent with provider=gemini gets session defaults", func(t *testing.T) {
+		t.Parallel()
+		// Custom agent using a different binary but declaring gemini as provider
+		input := &RuntimeConfig{
+			Provider: "gemini",
+			Command:  "gemini-custom",
+			Args:     []string{"--fast-mode"},
+		}
+
+		result := fillRuntimeDefaults(input)
+
+		// Session should be auto-filled from gemini preset
+		if result.Session == nil {
+			t.Fatal("Session should be auto-filled from gemini preset")
+		}
+		if result.Session.SessionIDEnv != "GEMINI_SESSION_ID" {
+			t.Errorf("Session.SessionIDEnv = %q, want GEMINI_SESSION_ID", result.Session.SessionIDEnv)
+		}
+		// Tmux should be auto-filled from gemini preset
+		if result.Tmux == nil {
+			t.Fatal("Tmux should be auto-filled from gemini preset")
+		}
+		found := false
+		for _, name := range result.Tmux.ProcessNames {
+			if name == "gemini" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Tmux.ProcessNames should contain 'gemini', got %v", result.Tmux.ProcessNames)
+		}
+		// User-specified Args should be preserved
+		if len(result.Args) != 1 || result.Args[0] != "--fast-mode" {
+			t.Errorf("Args should be preserved: got %v", result.Args)
+		}
+	})
+
+	t.Run("custom agent infers preset from command name", func(t *testing.T) {
+		t.Parallel()
+		// No provider set, but command matches a known preset
+		input := &RuntimeConfig{
+			Command: "gemini",
+			Args:    []string{"--approval-mode", "custom"},
+		}
+
+		result := fillRuntimeDefaults(input)
+
+		// Should get gemini preset defaults
+		if result.Session == nil {
+			t.Fatal("Session should be auto-filled from gemini preset (inferred from command)")
+		}
+		if result.Session.SessionIDEnv != "GEMINI_SESSION_ID" {
+			t.Errorf("Session.SessionIDEnv = %q, want GEMINI_SESSION_ID", result.Session.SessionIDEnv)
+		}
+		// Args should be preserved (user override)
+		if len(result.Args) != 2 || result.Args[0] != "--approval-mode" {
+			t.Errorf("Args should be preserved: got %v", result.Args)
+		}
+	})
+
+	t.Run("preset defaults not applied when fields already set", func(t *testing.T) {
+		t.Parallel()
+		// All fields explicitly set — preset should not override
+		input := &RuntimeConfig{
+			Provider: "claude",
+			Command:  "custom-claude",
+			Session: &RuntimeSessionConfig{
+				SessionIDEnv: "MY_SESSION_ID",
+			},
+			Tmux: &RuntimeTmuxConfig{
+				ProcessNames: []string{"my-process"},
+			},
+			Instructions: &RuntimeInstructionsConfig{
+				File: "MY.md",
+			},
+			PromptMode: "none",
+		}
+
+		result := fillRuntimeDefaults(input)
+
+		// User-set fields should not be overridden by preset
+		if result.Session.SessionIDEnv != "MY_SESSION_ID" {
+			t.Errorf("Session.SessionIDEnv overridden: got %q, want MY_SESSION_ID", result.Session.SessionIDEnv)
+		}
+		if len(result.Tmux.ProcessNames) != 1 || result.Tmux.ProcessNames[0] != "my-process" {
+			t.Errorf("Tmux.ProcessNames overridden: got %v, want [my-process]", result.Tmux.ProcessNames)
+		}
+		if result.Instructions.File != "MY.md" {
+			t.Errorf("Instructions.File overridden: got %q, want MY.md", result.Instructions.File)
+		}
+		if result.PromptMode != "none" {
+			t.Errorf("PromptMode overridden: got %q, want none", result.PromptMode)
+		}
+	})
 }
 
 // TestLookupAgentConfigPreservesCustomFields verifies that custom agents
@@ -3287,6 +3651,9 @@ func TestLookupAgentConfigPreservesCustomFields(t *testing.T) {
 	if rc.Env["OPENCODE_PERMISSION"] != `{"*":"allow"}` {
 		t.Errorf("Env was not preserved: got %v", rc.Env)
 	}
+	if rc.Env["OPENCODE_CONFIG_CONTENT"] != `{"lsp":true}` {
+		t.Errorf("OpenCode LSP default missing: got %v", rc.Env)
+	}
 	if rc.Tmux == nil || len(rc.Tmux.ProcessNames) != 2 {
 		t.Errorf("Tmux.ProcessNames not preserved: got %+v", rc.Tmux)
 	}
@@ -3314,6 +3681,167 @@ func TestBuildCommandWithPromptRespectsPromptModeNone(t *testing.T) {
 	}
 }
 
+// captureStderr redirects os.Stderr for the duration of fn and returns what was written.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe: %v", err)
+	}
+	os.Stderr = w
+	fn()
+	_ = w.Close()
+	os.Stderr = old
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+	_ = r.Close()
+	return buf.String()
+}
+
+// TestBuildCommandWithPromptWarnsOnDroppedPrompt verifies that when PromptMode
+// is "none" and a non-empty prompt is provided, a warning is emitted to stderr.
+// This makes the misconfiguration self-diagnosing (issue #3803).
+func TestBuildCommandWithPromptWarnsOnDroppedPrompt(t *testing.T) {
+	rc := &RuntimeConfig{
+		Command:    "claude",
+		Args:       []string{"--dangerously-skip-permissions"},
+		PromptMode: "none",
+	}
+
+	var cmd string
+	stderr := captureStderr(t, func() {
+		cmd = rc.BuildCommandWithPrompt("[GAS TOWN] deacon <- daemon • patrol")
+	})
+
+	if strings.Contains(cmd, "GAS TOWN") {
+		t.Errorf("prompt_mode=none should prevent prompt from appearing in command, got: %s", cmd)
+	}
+	if !strings.Contains(stderr, "warning:") {
+		t.Errorf("expected a warning on stderr when prompt is dropped, got: %q", stderr)
+	}
+	if !strings.Contains(stderr, "prompt_mode") {
+		t.Errorf("warning should mention prompt_mode, got: %q", stderr)
+	}
+	if !strings.Contains(stderr, `"claude"`) {
+		t.Errorf("warning should include the agent command name, got: %q", stderr)
+	}
+}
+
+// TestBuildCommandWithPromptNoWarnOnEmptyPrompt verifies that no warning is
+// emitted when the prompt is empty (that is the normal PromptMode:"none" use case).
+func TestBuildCommandWithPromptNoWarnOnEmptyPrompt(t *testing.T) {
+	rc := &RuntimeConfig{
+		Command:    "codex",
+		Args:       []string{},
+		PromptMode: "none",
+	}
+
+	stderr := captureStderr(t, func() {
+		_ = rc.BuildCommandWithPrompt("")
+	})
+
+	if stderr != "" {
+		t.Errorf("no warning expected when prompt is empty, got: %q", stderr)
+	}
+}
+
+func TestCodexBuildCommandWithPromptIncludesBootstrapPrompt(t *testing.T) {
+	rc := RuntimeConfigFromPreset(AgentCodex)
+
+	var cmd string
+	stderr := captureStderr(t, func() {
+		cmd = rc.BuildCommandWithPrompt("bootstrap now")
+	})
+
+	if stderr != "" {
+		t.Errorf("no warning expected for codex prompt delivery, got: %q", stderr)
+	}
+	if !strings.Contains(cmd, "bootstrap now") {
+		t.Errorf("codex startup command should include bootstrap prompt, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, codexUpdateCheckConfig) {
+		t.Errorf("codex startup command should suppress update checks, got: %s", cmd)
+	}
+}
+
+func TestFillRuntimeDefaultsCodexCustomArgsSuppressesUpdateCheck(t *testing.T) {
+	rc := fillRuntimeDefaults(&RuntimeConfig{
+		Provider: "codex",
+		Command:  "codex",
+		Args:     []string{"--profile", "fast"},
+	})
+
+	args := strings.Join(rc.Args, " ")
+	if !strings.Contains(args, codexUpdateCheckConfig) {
+		t.Fatalf("codex custom args missing update suppression: %v", rc.Args)
+	}
+	if strings.Count(args, "check_for_update_on_startup") != 1 {
+		t.Fatalf("codex update suppression duplicated: %v", rc.Args)
+	}
+}
+
+func TestFillRuntimeDefaultsCodexDoesNotOverrideExplicitUpdateCheck(t *testing.T) {
+	rc := fillRuntimeDefaults(&RuntimeConfig{
+		Provider: "codex",
+		Command:  "codex",
+		Args:     []string{"-c", "check_for_update_on_startup=true"},
+	})
+
+	args := strings.Join(rc.Args, " ")
+	if strings.Count(args, "check_for_update_on_startup") != 1 {
+		t.Fatalf("explicit codex update config should not be duplicated: %v", rc.Args)
+	}
+	if !strings.Contains(args, "check_for_update_on_startup=true") {
+		t.Fatalf("explicit codex update config should be preserved: %v", rc.Args)
+	}
+}
+
+func TestFillRuntimeDefaultsCodexIgnoresUnrelatedUpdateCheckSubstring(t *testing.T) {
+	rc := fillRuntimeDefaults(&RuntimeConfig{
+		Provider: "codex",
+		Command:  "codex",
+		Args:     []string{"--profile=check_for_update_on_startup-note"},
+	})
+
+	found := false
+	for _, arg := range rc.Args {
+		if arg == codexUpdateCheckConfig {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("codex update suppression should be injected despite unrelated substring: %v", rc.Args)
+	}
+}
+
+// TestBuildArgsWithPromptWarnsOnDroppedPrompt verifies the parallel warning in
+// BuildArgsWithPrompt when PromptMode is "none" and a non-empty prompt is provided.
+func TestBuildArgsWithPromptWarnsOnDroppedPrompt(t *testing.T) {
+	rc := &RuntimeConfig{
+		Command:    "claude",
+		Args:       []string{"--dangerously-skip-permissions"},
+		PromptMode: "none",
+	}
+
+	var args []string
+	stderr := captureStderr(t, func() {
+		args = rc.BuildArgsWithPrompt("[GAS TOWN] deacon <- daemon • patrol")
+	})
+
+	for _, arg := range args {
+		if strings.Contains(arg, "GAS TOWN") {
+			t.Errorf("prompt_mode=none should prevent prompt appearing in args, got: %v", args)
+		}
+	}
+	if !strings.Contains(stderr, "warning:") {
+		t.Errorf("expected a warning on stderr when prompt is dropped, got: %q", stderr)
+	}
+}
+
 // TestRoleAgentConfigWithCustomAgent tests role-based agent resolution with
 // custom agents that have special settings like prompt_mode: "none".
 //
@@ -3332,7 +3860,7 @@ func TestBuildCommandWithPromptRespectsPromptModeNone(t *testing.T) {
 //	      "command": "opencode",
 //	      "args": ["-m", "openai/gpt-5.2-codex"],
 //	      "prompt_mode": "none",
-//	      "process_names": ["opencode", "node"],
+//	      "process_names": ["opencode", "node", "bun"],
 //	      "env": {
 //	        "OPENCODE_PERMISSION": "{\"*\":\"allow\"}"
 //	      }
@@ -3349,11 +3877,11 @@ func TestBuildCommandWithPromptRespectsPromptModeNone(t *testing.T) {
 //	}
 //
 // Manual test procedure:
-//  1. Set role_agents.mayor to each agent (claude, gemini, codex, cursor, auggie, amp, opencode)
+//  1. Set role_agents.mayor to each agent (claude, gemini, codex, kiro, cursor, auggie, amp, opencode)
 //  2. Run: gt start
 //  3. Verify mayor starts with correct agent config
 //  4. Run: GT_NUKE_ACKNOWLEDGED=1 gt down --nuke
-//  5. Repeat for all 7 built-in agents
+//  5. Repeat for all built-in agents
 func TestRoleAgentConfigWithCustomAgent(t *testing.T) {
 	skipIfAgentBinaryMissing(t, "opencode", "claude")
 	t.Parallel()
@@ -3444,7 +3972,7 @@ func TestRoleAgentConfigWithCustomAgent(t *testing.T) {
 }
 
 // TestMultipleAgentTypes tests that various built-in agent presets work correctly.
-// NOTE: Only these are actual built-in presets: claude, gemini, codex, cursor, auggie, amp, opencode.
+// NOTE: Only these are actual built-in presets: claude, gemini, codex, kiro, cursor, auggie, amp, opencode.
 // Variants like "claude-opus", "claude-haiku", "claude-sonnet" are NOT built-in - they need
 // to be defined as custom agents in TownSettings.Agents if specific model selection is needed.
 func TestMultipleAgentTypes(t *testing.T) {
@@ -4865,13 +5393,13 @@ func TestTryResolveFromEphemeralTier(t *testing.T) {
 		}
 		found := false
 		for i, arg := range rc.Args {
-			if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "sonnet" {
+			if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "sonnet[1m]" {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Errorf("Args %v missing --model sonnet", rc.Args)
+			t.Errorf("Args %v missing --model sonnet[1m]", rc.Args)
 		}
 	})
 
@@ -4975,7 +5503,7 @@ func TestResolveRoleAgentConfig_EphemeralStandardSkipsPersisted(t *testing.T) {
 	for i, arg := range rc.Args {
 		if arg == "--model" && i+1 < len(rc.Args) {
 			model := rc.Args[i+1]
-			if model == "sonnet" || model == "haiku" {
+			if model == "sonnet" || model == "sonnet[1m]" || model == "haiku" {
 				t.Errorf("ephemeral standard should not use stale budget model; got --model %s", model)
 			}
 		}
@@ -5135,5 +5663,221 @@ func TestBuildStartupCommandWithAgentOverride_ExecWrapper(t *testing.T) {
 	// The wrapper + agent command should appear as a contiguous sequence
 	if !strings.Contains(cmd, "daytona exec furiosa-ws -- claude") {
 		t.Errorf("expected wrapper immediately before claude command, got: %q", cmd)
+	}
+}
+
+// --- Tests for GH#3153: --agent override skips --settings flag ---
+
+func TestWithRoleSettingsFlag_IdempotencyGuard(t *testing.T) {
+	t.Parallel()
+	rigPath := "/fake/town/myrig"
+	rc := &RuntimeConfig{
+		Command: "claude",
+		Args:    []string{"--dangerously-skip-permissions", "--settings", "/already/set/.claude/settings.json"},
+	}
+
+	before := len(rc.Args)
+	result := withRoleSettingsFlag(rc, "polecat", rigPath)
+
+	if len(result.Args) != before {
+		t.Errorf("idempotency guard failed: expected %d args, got %d — Args = %v", before, len(result.Args), result.Args)
+	}
+	count := 0
+	for _, arg := range result.Args {
+		if arg == "--settings" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 --settings flag, got %d — Args = %v", count, result.Args)
+	}
+}
+
+func TestBuildStartupCommandWithAgentOverride_SettingsFlagForClaudeOverride(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	townSettings := NewTownSettings()
+	townSettings.Agents["claude-sonnet"] = &RuntimeConfig{
+		Command: "claude",
+		Args:    []string{"--model", "sonnet", "--dangerously-skip-permissions"},
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd, err := BuildStartupCommandWithAgentOverride(
+		map[string]string{"GT_ROLE": "testrig/polecats/toast"},
+		rigPath,
+		"",
+		"claude-sonnet",
+	)
+	if err != nil {
+		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
+	}
+
+	if !strings.Contains(cmd, "--settings") {
+		t.Errorf("Claude override on polecat role should include --settings, got: %q", cmd)
+	}
+	expectedPath := filepath.Join(rigPath, "polecats", ".claude", "settings.json")
+	if !strings.Contains(cmd, expectedPath) {
+		t.Errorf("expected settings path %q in command, got: %q", expectedPath, cmd)
+	}
+}
+
+func TestBuildPolecatStartupCommandWithAgentOverride_IncludesSettingsFlag(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	townSettings := NewTownSettings()
+	townSettings.Agents["claude-sonnet"] = &RuntimeConfig{
+		Command: "claude",
+		Args:    []string{"--model", "sonnet", "--dangerously-skip-permissions"},
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd, err := BuildPolecatStartupCommandWithAgentOverride("testrig", "toast", rigPath, "", "claude-sonnet")
+	if err != nil {
+		t.Fatalf("BuildPolecatStartupCommandWithAgentOverride: %v", err)
+	}
+
+	if !strings.Contains(cmd, "--settings") {
+		t.Errorf("polecat with Claude override must get --settings for hooks to fire, got: %q", cmd)
+	}
+	expectedPath := filepath.Join(rigPath, "polecats", ".claude", "settings.json")
+	if !strings.Contains(cmd, expectedPath) {
+		t.Errorf("expected settings path %q in command, got: %q", expectedPath, cmd)
+	}
+}
+
+func TestBuildStartupCommandWithAgentOverride_NoSettingsFlagForNonClaude(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	townSettings := NewTownSettings()
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd, err := BuildStartupCommandWithAgentOverride(
+		map[string]string{"GT_ROLE": "testrig/polecats/toast"},
+		rigPath,
+		"",
+		"gemini",
+	)
+	if err != nil {
+		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
+	}
+
+	if strings.Contains(cmd, "--settings") {
+		t.Errorf("non-Claude override (gemini) should NOT get --settings, got: %q", cmd)
+	}
+}
+
+func TestBuildStartupCommandWithAgentOverride_NoDoubleSettingsOnNonOverridePath(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	townSettings := NewTownSettings()
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	// No override — ResolveRoleAgentConfig already adds --settings for polecat role.
+	// The new withRoleSettingsFlag call in BuildStartupCommandWithAgentOverride should
+	// be a no-op (idempotency guard), not double-add.
+	cmd, err := BuildStartupCommandWithAgentOverride(
+		map[string]string{"GT_ROLE": "testrig/polecats/toast"},
+		rigPath,
+		"",
+		"", // no override
+	)
+	if err != nil {
+		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
+	}
+
+	count := strings.Count(cmd, "--settings")
+	if count > 1 {
+		t.Errorf("expected at most 1 --settings flag (idempotency guard), got %d — cmd: %q", count, cmd)
+	}
+	if count == 0 {
+		t.Errorf("default Claude agent on polecat role should still get --settings, got: %q", cmd)
+	}
+}
+
+func TestResolveAgentConfigWithOverrideSetsResolvedAgent(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	if err := SaveTownSettings(TownSettingsPath(townRoot), NewTownSettings()); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	for _, agentName := range []string{"opencode", "gemini", "codex", "claude", "copilot"} {
+		rc, resolvedAgent, err := ResolveAgentConfigWithOverride(townRoot, rigPath, agentName)
+		if err != nil {
+			t.Fatalf("ResolveAgentConfigWithOverride(%q): %v", agentName, err)
+		}
+		if resolvedAgent != agentName {
+			t.Errorf("resolved agent for %q: got %q, want %q", agentName, resolvedAgent, agentName)
+		}
+		if rc.ResolvedAgent != agentName {
+			t.Errorf("RuntimeConfig.ResolvedAgent for %q: got %q, want %q", agentName, rc.ResolvedAgent, agentName)
+		}
+	}
+}
+
+func TestBuildStartupCommandWithAgentOverrideSetsGTAgentForOpenCode(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	if err := SaveTownSettings(TownSettingsPath(townRoot), NewTownSettings()); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd, err := BuildStartupCommandWithAgentOverride(
+		map[string]string{"GT_ROLE": constants.RolePolecat},
+		rigPath,
+		"[GAS TOWN] test polecat beacon",
+		"opencode",
+	)
+	if err != nil {
+		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
+	}
+
+	if !strings.Contains(cmd, "GT_AGENT=opencode") {
+		t.Errorf("expected GT_AGENT=opencode in command, got: %q", cmd)
+	}
+	if !strings.Contains(cmd, "GT_PROCESS_NAMES=opencode") {
+		t.Errorf("expected GT_PROCESS_NAMES=opencode in command, got: %q", cmd)
+	}
+	if strings.Contains(cmd, "--settings") {
+		t.Errorf("opencode should not get Claude --settings, got: %q", cmd)
 	}
 }

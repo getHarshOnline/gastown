@@ -71,13 +71,18 @@ const (
 	DialogPollTimeout = 8 * time.Second
 
 	// StartupNudgeVerifyDelay is how long to wait after sending a startup nudge
-	// before checking if the agent started working.
+	// before checking if the agent started working. 25s because Claude may
+	// still be processing gt prime output and preparing its first response;
+	// the c2claude wrapper adds extra latency. 5s was consistently too short,
+	// causing false retries that interrupted Claude mid-processing (GH#3031).
 	// Configurable via operational.session.startup_nudge_verify_delay.
-	StartupNudgeVerifyDelay = 5 * time.Second
+	StartupNudgeVerifyDelay = 25 * time.Second
 
 	// StartupNudgeMaxRetries is the maximum number of times to retry a startup nudge.
+	// With the 25s verify delay, 2 retries = 50s total before deferring to
+	// witness zombie patrol. Reduced from 3 to limit interrupt risk (GH#3031).
 	// Configurable via operational.session.startup_nudge_max_retries.
-	StartupNudgeMaxRetries = 3
+	StartupNudgeMaxRetries = 2
 
 	// MinHandoffCooldown is the minimum time between handoffs for the same
 	// component. Prevents tight restart loops when a patrol agent (e.g.,
@@ -178,11 +183,21 @@ const (
 	//   gate          - Async coordination (bd gate wait, park/resume)
 	//   merge-request - Refinery MR processing (gt done, refinery)
 	BeadsCustomTypes = "agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request"
+
+	// BeadsInfraTypes is the comma-separated list of issue types that beads should
+	// store as ephemeral wisps. Rig identity beads intentionally stay custom but
+	// not infra so their durable state survives wisp cleanup.
+	BeadsInfraTypes = "agent,role,message"
 )
 
 // BeadsCustomTypesList returns the custom types as a slice.
 func BeadsCustomTypesList() []string {
 	return []string{"agent", "role", "rig", "convoy", "slot", "queue", "event", "message", "molecule", "gate", "merge-request"}
+}
+
+// BeadsInfraTypesList returns the infra types as a slice.
+func BeadsInfraTypesList() []string {
+	return []string{"agent", "role", "message"}
 }
 
 // Beads custom status configuration constants.
@@ -248,6 +263,9 @@ const (
 
 	// RoleDeacon is the deacon agent role.
 	RoleDeacon = "deacon"
+
+	// RoleBoot is the boot watchdog role (modeled as a deacon dog).
+	RoleBoot = "boot"
 )
 
 // Role emojis - centralized for easy customization.
@@ -270,6 +288,9 @@ const (
 
 	// EmojiPolecat is the polecat emoji (transient worker).
 	EmojiPolecat = "😺"
+
+	// EmojiBoot is the boot watchdog emoji (dog).
+	EmojiBoot = "🐾"
 )
 
 // Molecule formula names for patrol and dog workflows.
@@ -293,6 +314,9 @@ const (
 
 	// MolDogCompactor is the Dolt compactor dog formula name.
 	MolDogCompactor = "mol-dog-compactor"
+
+	// MolDogCheckpoint is the WIP checkpoint dog formula name.
+	MolDogCheckpoint = "mol-dog-checkpoint"
 
 	// MolDogDoctor is the health anomaly tracking dog formula name.
 	MolDogDoctor = "mol-dog-doctor"
@@ -327,6 +351,8 @@ func RoleEmoji(role string) string {
 		return EmojiCrew
 	case RolePolecat:
 		return EmojiPolecat
+	case RoleBoot:
+		return EmojiBoot
 	default:
 		return "❓"
 	}
@@ -334,7 +360,7 @@ func RoleEmoji(role string) string {
 
 // SupportedShells lists shell binaries that Gas Town can detect and work with.
 // Used to identify if a tmux pane is at a shell prompt vs running a command.
-var SupportedShells = []string{"bash", "zsh", "sh", "fish", "tcsh", "ksh"}
+var SupportedShells = []string{"bash", "zsh", "sh", "fish", "tcsh", "ksh", "pwsh", "powershell"}
 
 // Path helpers construct common paths.
 
@@ -425,4 +451,3 @@ var DefaultNearLimitPatterns = []string{
 	`almost\s+(at|hit|reached)\s+(your\s+)?(rate\s+)?limit`,       // "almost reached your rate limit"
 	`\d+\s*(messages?|requests?)\s*(left|remaining)`,               // "10 messages remaining"
 }
-

@@ -26,6 +26,7 @@ type CheckMisclassifiedWisps struct {
 
 type misclassifiedWisp struct {
 	rigName string
+	workDir string
 	id      string
 	title   string
 	reason  string
@@ -61,14 +62,7 @@ func (c *CheckMisclassifiedWisps) Run(ctx *CheckContext) *CheckResult {
 
 	if useDolt {
 		for _, db := range databases {
-			prefix := db + "-"
-			rigDir := beads.GetRigPathForPrefix(ctx.TownRoot, prefix)
-			if rigDir == "" {
-				rigDir = filepath.Join(ctx.TownRoot, db)
-				if db == "hq" {
-					rigDir = ctx.TownRoot
-				}
-			}
+			rigDir := resolveMisclassifiedWispWorkDir(ctx.TownRoot, misclassifiedWisp{rigName: db})
 			found, probeErrors := c.findMisplacedEphemeralsDolt(rigDir, db)
 			totalProbeErrors += probeErrors
 			if len(found) > 0 {
@@ -141,6 +135,7 @@ func (c *CheckMisclassifiedWisps) findMisplacedEphemeralsDolt(rigDir, rigName st
 		}
 		found = append(found, misclassifiedWisp{
 			rigName: rigName,
+			workDir: rigDir,
 			id:      strings.TrimSpace(rec[0]),
 			title:   strings.TrimSpace(rec[1]),
 			reason:  "ephemeral bead in issues table",
@@ -161,18 +156,14 @@ func (c *CheckMisclassifiedWisps) Fix(ctx *CheckContext) error {
 	// Group by rig for batch operations.
 	rigBatches := make(map[string][]misclassifiedWisp)
 	for _, w := range c.misclassified {
-		rigBatches[w.rigName] = append(rigBatches[w.rigName], w)
+		workDir := resolveMisclassifiedWispWorkDir(ctx.TownRoot, w)
+		rigBatches[workDir] = append(rigBatches[workDir], w)
 	}
 
 	var errs []string
 
-	for rigName, batch := range rigBatches {
-		var workDir string
-		if rigName == "town" || rigName == "hq" {
-			workDir = ctx.TownRoot
-		} else {
-			workDir = filepath.Join(ctx.TownRoot, rigName)
-		}
+	for workDir, batch := range rigBatches {
+		rigName := batch[0].rigName
 
 		ids := make([]string, len(batch))
 		for i, w := range batch {
@@ -189,6 +180,22 @@ func (c *CheckMisclassifiedWisps) Fix(ctx *CheckContext) error {
 		return fmt.Errorf("partial fix: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+func resolveMisclassifiedWispWorkDir(townRoot string, w misclassifiedWisp) string {
+	if w.workDir != "" {
+		return w.workDir
+	}
+
+	if w.rigName == "town" || w.rigName == "hq" {
+		return townRoot
+	}
+
+	if rigDir := beads.GetRigPathForPrefix(townRoot, w.rigName+"-"); rigDir != "" {
+		return rigDir
+	}
+
+	return filepath.Join(townRoot, w.rigName)
 }
 
 // purgeRigBatch migrates a batch of ephemeral beads from issues to wisps:
@@ -233,12 +240,32 @@ func (c *CheckMisclassifiedWisps) purgeRigBatch(ctx *CheckContext, workDir, rigN
 		},
 		{
 			table: "wisp_dependencies",
-			query: fmt.Sprintf("INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) SELECT d.issue_id, d.depends_on_id, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d WHERE d.issue_id IN (%s)", idList),
+			query: fmt.Sprintf("INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external, type, created_at, created_by, metadata, thread_id) SELECT d.issue_id, CASE WHEN target_wisp.id IS NULL THEN d.depends_on_issue_id ELSE NULL END, CASE WHEN target_wisp.id IS NOT NULL THEN d.depends_on_issue_id ELSE d.depends_on_wisp_id END, d.depends_on_external, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d LEFT JOIN wisps target_wisp ON target_wisp.id = d.depends_on_issue_id WHERE d.issue_id IN (%s)", idList),
 		},
 	}
+	copyErrors := map[string]error{}
 	for _, aux := range auxCopies {
-		if bdTableExistsDoctor(workDir, aux.table) {
-			_ = execBdSQLWrite(workDir, aux.query) // Best-effort
+		if !bdTableExistsDoctor(workDir, aux.table) {
+			if aux.table == "wisp_dependencies" && bdTableExistsDoctor(workDir, "dependencies") {
+				copyErrors[aux.table] = fmt.Errorf("target table missing")
+			}
+			continue
+		}
+		if err := execBdSQLWrite(workDir, aux.query); err != nil {
+			copyErrors[aux.table] = err
+		}
+	}
+	if err := copyErrors["wisp_dependencies"]; err != nil {
+		return fmt.Errorf("copying wisp_dependencies: %w", err)
+	}
+	if bdTableExistsDoctor(workDir, "wisp_dependencies") {
+		if err := execBdSQLWrite(workDir, fmt.Sprintf("UPDATE wisp_dependencies SET depends_on_wisp_id = depends_on_issue_id, depends_on_issue_id = NULL WHERE depends_on_issue_id IN (%s)", idList)); err != nil {
+			return fmt.Errorf("retargeting incoming wisp_dependencies: %w", err)
+		}
+	}
+	if bdTableExistsDoctor(workDir, "dependencies") {
+		if err := execBdSQLWrite(workDir, fmt.Sprintf("UPDATE dependencies SET depends_on_wisp_id = depends_on_issue_id, depends_on_issue_id = NULL WHERE depends_on_issue_id IN (%s)", idList)); err != nil {
+			return fmt.Errorf("retargeting incoming dependencies: %w", err)
 		}
 	}
 

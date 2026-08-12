@@ -564,11 +564,24 @@ func normalizeAddress(s string) string {
 		return "deacon/"
 	}
 
-	// Normalize crew/ and polecats/ to canonical form:
-	// "rig/crew/name" → "rig/name"
-	// "rig/polecats/name" → "rig/name"
+	// Resolve rig-scoped town-level roles to their canonical form (gt-te23).
+	// "gastown/mayor" → "mayor/", "gastown/deacon" → "deacon/"
+	// Mayor and deacon are town-level singletons, not rig-level agents.
 	parts := strings.Split(s, "/")
-	if len(parts) == 3 && (parts[1] == "crew" || parts[1] == "polecats") {
+	if len(parts) == 2 {
+		switch parts[1] {
+		case "mayor":
+			return "mayor/"
+		case "deacon":
+			return "deacon/"
+		}
+	}
+
+	// Normalize crew/, polecat/, and polecats/ to canonical form:
+	// "rig/crew/name" → "rig/name"
+	// "rig/polecat/name" → "rig/name" (legacy singular input)
+	// "rig/polecats/name" → "rig/name"
+	if len(parts) == 3 && (parts[1] == "crew" || parts[1] == "polecat" || parts[1] == "polecats") {
 		return parts[0] + "/" + parts[2]
 	}
 

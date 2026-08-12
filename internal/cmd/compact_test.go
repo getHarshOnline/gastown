@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,8 +24,8 @@ func TestGetTTL(t *testing.T) {
 		{"recovery", 7 * 24 * time.Hour},
 		{"escalation", 7 * 24 * time.Hour},
 		{"default", 24 * time.Hour},
-		{"", 24 * time.Hour},          // empty falls back to default
-		{"unknown", 24 * time.Hour},   // unknown falls back to default
+		{"", 24 * time.Hour},        // empty falls back to default
+		{"unknown", 24 * time.Hour}, // unknown falls back to default
 	}
 
 	for _, tc := range tests {
@@ -158,21 +160,71 @@ func TestIsReferenced(t *testing.T) {
 
 func TestCompactTruncate(t *testing.T) {
 	tests := []struct {
+		name   string
 		s      string
 		maxLen int
 		want   string
 	}{
-		{"short", 10, "short"},
-		{"exactly10!", 10, "exactly10!"},
-		{"this is too long", 10, "this is..."},
-		{"ab", 3, "ab"},
-		{"abcdef", 3, "abc"},
+		{"short ASCII", "short", 10, "short"},
+		{"exact length", "exactly10!", 10, "exactly10!"},
+		{"ASCII too long", "this is too long", 10, "this is..."},
+		{"short maxLen", "ab", 3, "ab"},
+		{"maxLen 3", "abcdef", 3, "abc"},
+		// Multi-byte UTF-8: emoji is 1 rune, not 4 bytes
+		{"emoji within limit", "🤝 HANDOFF", 10, "🤝 HANDOFF"},
+		{"emoji truncated", "🤝 HANDOFF: Routine cycle for witness", 15, "🤝 HANDOFF: R..."},
+		// CJK characters: each is 1 rune, 3 bytes
+		{"CJK within limit", "日本語テスト", 10, "日本語テスト"},
+		{"CJK truncated", "日本語テストデータ", 6, "日本語..."},
 	}
 
 	for _, tc := range tests {
-		t.Run(tc.s, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			if got := compactTruncate(tc.s, tc.maxLen); got != tc.want {
 				t.Errorf("compactTruncate(%q, %d) = %q, want %q", tc.s, tc.maxLen, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExtractJSONArray(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{
+			"clean JSON array",
+			`[{"id":"test"}]`,
+			`[{"id":"test"}]`,
+		},
+		{
+			"warning prefix before JSON",
+			"Warning: no route found for prefix \"gt-\"\n[{\"id\":\"test\"}]",
+			`[{"id":"test"}]`,
+		},
+		{
+			"unicode warning prefix",
+			"⚠ Warning: something with 🤝 emoji\n[{\"id\":\"test\"}]",
+			`[{"id":"test"}]`,
+		},
+		{
+			"no array in data",
+			"just some text without json",
+			"just some text without json",
+		},
+		{
+			"empty data",
+			"",
+			"",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := string(extractJSONArray([]byte(tc.data)))
+			if got != tc.want {
+				t.Errorf("extractJSONArray(%q) = %q, want %q", tc.data, got, tc.want)
 			}
 		})
 	}
@@ -215,4 +267,38 @@ func TestLoadTTLConfigWithRoleSkipsInvalidPaths(t *testing.T) {
 	if ttls["error"] != defaultTTLs["error"] {
 		t.Errorf("error TTL = %v, want %v", ttls["error"], defaultTTLs["error"])
 	}
+}
+
+func TestCleanOrphanedWispDepsUsesTypedTargets(t *testing.T) {
+	data, err := os.ReadFile("compact.go")
+	if err != nil {
+		t.Fatalf("read compact.go: %v", err)
+	}
+	body := compactSourceBetween(t, string(data), "func cleanOrphanedWispDeps(", "// listWisps")
+	if strings.Contains(body, "depends_on_id") {
+		t.Fatalf("cleanOrphanedWispDeps should not use legacy depends_on_id:\n%s", body)
+	}
+	for _, want := range []string{
+		"depends_on_wisp_id IS NOT NULL AND NOT EXISTS",
+		"wisps WHERE id = wisp_dependencies.depends_on_wisp_id",
+		"depends_on_issue_id IS NOT NULL AND NOT EXISTS",
+		"issues WHERE id = wisp_dependencies.depends_on_issue_id",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("cleanOrphanedWispDeps missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func compactSourceBetween(t *testing.T, source, startMarker, endMarker string) string {
+	t.Helper()
+	start := strings.Index(source, startMarker)
+	if start == -1 {
+		t.Fatalf("could not find %q", startMarker)
+	}
+	end := strings.Index(source[start:], endMarker)
+	if end == -1 {
+		t.Fatalf("could not find %q after %q", endMarker, startMarker)
+	}
+	return source[start : start+end]
 }

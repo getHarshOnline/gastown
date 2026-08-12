@@ -74,9 +74,15 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	// as cancel (e.g., Gemini CLI), skip the Escape keystroke during delivery
 	// to avoid canceling in-flight generation. (GH#gt-wasn)
 	nudgeOpts := tmux.NudgeOpts{}
-	if agentName, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && agentName != "" {
-		if preset := config.GetAgentPresetByName(agentName); preset != nil && preset.EscapeCancelsRequest {
-			nudgeOpts.SkipEscape = true
+	agentName := ""
+	hasPromptDetection := false
+	if name, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && name != "" {
+		agentName = name
+		if preset := config.GetAgentPresetByName(agentName); preset != nil {
+			hasPromptDetection = preset.ReadyPromptPrefix != ""
+			if preset.EscapeCancelsRequest {
+				nudgeOpts.SkipEscape = true
+			}
 		}
 	}
 
@@ -103,13 +109,13 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 				continue
 			}
 
-			// Best-effort idle check: try to wait for the agent to become idle.
-			// WaitForIdle is designed for Claude Code's ⏵⏵ status bar and ❯ prompt.
-			// For other agents (Gemini, Codex, etc.) it will always time out because
-			// their TUI doesn't match Claude's idle patterns. In that case we drain
-			// anyway — delivering a nudge mid-work is better than never delivering it.
-			// The poll interval (10s) provides natural rate limiting.
-			_ = t.WaitForIdle(sessionName, idleTimeout)
+			// For runtimes with prompt detection, defer delivery until the session
+			// is actually idle. Runtimes without prompt detection preserve the old
+			// best-effort behavior and drain on the poll interval.
+			waitErr := t.WaitForIdle(sessionName, idleTimeout)
+			if shouldSkipDrainUntilIdle(hasPromptDetection, waitErr) {
+				continue
+			}
 
 			// Drain and inject.
 			drained, err := nudge.Drain(townRoot, sessionName)
@@ -124,7 +130,12 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			formatted := nudge.FormatForInjection(drained)
 			if err := t.NudgeSessionWithOpts(sessionName, formatted, nudgeOpts); err != nil {
 				fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
+				requeueDrainedNudges(townRoot, sessionName, "nudge-poller", drained)
 			}
 		}
 	}
+}
+
+func shouldSkipDrainUntilIdle(hasPromptDetection bool, waitErr error) bool {
+	return hasPromptDetection && waitErr != nil
 }

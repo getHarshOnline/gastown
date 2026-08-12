@@ -21,14 +21,31 @@ const (
 	AgentStateRunning      AgentState = "running"
 	AgentStateNuked        AgentState = "nuked"
 	AgentStateAwaitingGate AgentState = "awaiting-gate"
+	// Deacon lifecycle states (hq-sa8de Phase A).
+	// patrolling: mid-cycle. idle (shared): cycle done, awaiting daemon poke.
+	// paused: operator-held standby via `gt deacon pause`.
+	AgentStatePatrolling AgentState = "patrolling"
+	AgentStatePaused     AgentState = "paused"
 )
+
+// ResolveAgentState returns the agent state Gastown should act on.
+// bd >= 0.62.0 no longer exposes a supported `bd agent state` writer, so the
+// description's `agent_state:` field is the primary write/read contract.
+// Fall back to the structured column only for legacy beads that do not yet
+// mirror agent_state into the description.
+func ResolveAgentState(description, structured string) string {
+	if fields := ParseAgentFields(description); fields != nil && fields.AgentState != "" {
+		return fields.AgentState
+	}
+	return structured
+}
 
 // ProtectsFromCleanup returns true if this agent state indicates an intentional
 // pause that should prevent the polecat from being cleaned up as stale.
 // States like "stuck" and "awaiting-gate" mean the polecat is paused on purpose.
 func (s AgentState) ProtectsFromCleanup() bool {
 	switch s {
-	case AgentStateStuck, AgentStateAwaitingGate:
+	case AgentStateStuck, AgentStateAwaitingGate, AgentStatePaused:
 		return true
 	default:
 		return false
@@ -38,7 +55,7 @@ func (s AgentState) ProtectsFromCleanup() bool {
 // IsActive returns true if the agent is actively doing work.
 func (s AgentState) IsActive() bool {
 	switch s {
-	case AgentStateWorking, AgentStateRunning, AgentStateSpawning:
+	case AgentStateWorking, AgentStateRunning, AgentStateSpawning, AgentStatePatrolling:
 		return true
 	default:
 		return false
@@ -58,6 +75,7 @@ const (
 	StatusInProgress IssueStatus = "in_progress"
 	StatusTombstone  IssueStatus = "tombstone"
 	StatusBlocked    IssueStatus = "blocked"
+	StatusDeferred   IssueStatus = "deferred"
 	// StatusPinned and StatusHooked are defined as untyped string constants in
 	// handoff.go. Use IssueStatusPinned/IssueStatusHooked for typed comparisons.
 	IssueStatusPinned IssueStatus = "pinned"

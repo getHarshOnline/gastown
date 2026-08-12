@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/hooks"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -16,18 +17,23 @@ var hooksSyncDryRun bool
 
 var hooksSyncCmd = &cobra.Command{
 	Use:   "sync",
-	Short: "Regenerate all .claude/settings.json files",
-	Long: `Regenerate all .claude/settings.json files from the base config and overrides.
+	Short: "Regenerate all agent hook/settings files",
+	Long: `Regenerate hook and settings files for all agents across the workspace.
 
-For each target (mayor, deacon, rig/crew, rig/witness, etc.):
+For Claude agents (settings.json merge):
 1. Load base config
 2. Apply role override (if exists)
 3. Apply rig+role override (if exists)
 4. Merge hooks section into existing settings.json (preserving all fields)
 5. Write updated settings.json
 
+For template-based agents (OpenCode, Gemini, Copilot, etc.):
+1. Resolve the agent configured for each role
+2. Compare deployed hook file against current template
+3. Overwrite if content differs
+
 Examples:
-  gt hooks sync             # Regenerate all settings.json files
+  gt hooks sync             # Regenerate all hook/settings files
   gt hooks sync --dry-run   # Show what would change without writing`,
 	RunE: runHooksSync,
 }
@@ -108,6 +114,100 @@ func runHooksSync(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Sync template-based (non-Claude) agents at each role location.
+	// These agents use SyncForRole (content-aware comparison) instead of the
+	// JSON merge path used for Claude targets above.
+	locations, locErr := hooks.DiscoverRoleLocations(townRoot)
+	if locErr != nil {
+		fmt.Printf("  %s discovering role locations: %v\n", style.Error.Render("✖"), locErr)
+		errors++
+	} else {
+		for _, loc := range locations {
+			rigPath := ""
+			if loc.Rig != "" {
+				rigPath = filepath.Join(townRoot, loc.Rig)
+			}
+
+			// Use ResolveRoleAgentName (not ResolveRoleAgentConfig) so that hooks are
+			// installed based on the *configured* agent, not the *resolved* one.
+			// ResolveRoleAgentConfig falls back to claude when the agent binary is not
+			// found in PATH (e.g., in CI or on a fresh machine), which would silently
+			// skip creating opencode/gemini/etc. plugin files.
+			agentName, _ := config.ResolveRoleAgentName(loc.Role, townRoot, rigPath)
+			if agentName == "" {
+				continue
+			}
+
+			preset := config.GetAgentPresetByName(agentName)
+			if preset == nil || preset.HooksDir == "" || preset.HooksSettingsFile == "" {
+				continue
+			}
+
+			hooksProvider := preset.HooksProvider
+			if hooksProvider == "" {
+				hooksProvider = agentName
+			}
+
+			// Claude targets are already handled by DiscoverTargets + syncTarget above.
+			if hooksProvider == "claude" {
+				continue
+			}
+
+			useSettingsDir := preset.HooksUseSettingsDir
+
+			// Determine sync targets.
+			// - Town-level roles (mayor, deacon): the role dir IS the working directory.
+			// - Rig roles with useSettingsDir: one shared file in the role parent.
+			// - Rig roles without useSettingsDir (OpenCode, etc.): need files in each
+			//   individual worktree subdirectory.
+			var syncDirs []string
+			if loc.Rig == "" || useSettingsDir {
+				syncDirs = []string{loc.Dir}
+			} else {
+				syncDirs = hooks.DiscoverWorktrees(loc.Dir)
+			}
+
+			for _, dir := range syncDirs {
+				targetPath := filepath.Join(dir, preset.HooksDir, preset.HooksSettingsFile)
+				relPath, pathErr := filepath.Rel(townRoot, targetPath)
+				if pathErr != nil {
+					relPath = targetPath
+				}
+
+				if hooksSyncDryRun {
+					if _, statErr := os.Stat(targetPath); statErr == nil {
+						fmt.Printf("  %s %s %s\n", style.Warning.Render("~"), relPath, style.Dim.Render("(would check "+hooksProvider+")"))
+					} else {
+						fmt.Printf("  %s %s %s\n", style.Warning.Render("~"), relPath, style.Dim.Render("(would create "+hooksProvider+")"))
+						created++
+					}
+					continue
+				}
+
+				result, syncErr := hooks.SyncForRole(hooksProvider, dir, dir, loc.Role,
+					preset.HooksDir, preset.HooksSettingsFile, useSettingsDir)
+				if syncErr != nil {
+					fmt.Printf("  %s %s (%s): %v\n", style.Error.Render("✖"), relPath, hooksProvider, syncErr)
+					errors++
+					failedTargets = append(failedTargets, relPath)
+					continue
+				}
+
+				switch result {
+				case hooks.SyncCreated:
+					fmt.Printf("  %s %s %s\n", style.Success.Render("✓"), relPath, style.Dim.Render("(created "+hooksProvider+")"))
+					created++
+				case hooks.SyncUpdated:
+					fmt.Printf("  %s %s %s\n", style.Success.Render("✓"), relPath, style.Dim.Render("(updated "+hooksProvider+")"))
+					updated++
+				case hooks.SyncUnchanged:
+					fmt.Printf("  %s %s %s\n", style.Dim.Render("·"), relPath, style.Dim.Render("(unchanged "+hooksProvider+")"))
+					unchanged++
+				}
+			}
+		}
+	}
+
 	// Summary
 	fmt.Println()
 	total := updated + unchanged + created + errors
@@ -152,62 +252,19 @@ const (
 // syncTarget syncs a single target's .claude/settings.json.
 // Uses MarshalSettings/UnmarshalSettings to preserve unknown fields.
 func syncTarget(target hooks.Target, dryRun bool) (syncResult, error) {
-	// Compute expected hooks for this target
-	expected, err := hooks.ComputeExpected(target.Key)
+	result, err := hooks.SyncManagedClaudeSettings(target, dryRun)
 	if err != nil {
-		return 0, fmt.Errorf("computing expected config: %w", err)
+		return 0, err
 	}
 
-	// Load existing settings (returns zero-value if file doesn't exist)
-	current, err := hooks.LoadSettings(target.Path)
-	if err != nil {
-		return 0, fmt.Errorf("loading current settings: %w", err)
-	}
-
-	// Check if the file exists
-	_, statErr := os.Stat(target.Path)
-	fileExists := statErr == nil
-
-	// Compare hooks sections
-	if fileExists && hooks.HooksEqual(expected, &current.Hooks) {
-		return syncUnchanged, nil
-	}
-
-	if dryRun {
-		if fileExists {
-			return syncUpdated, nil
-		}
+	switch result {
+	case hooks.SyncCreated:
 		return syncCreated, nil
-	}
-
-	// Update hooks section, preserving all other fields (including unknown ones)
-	current.Hooks = *expected
-
-	// Ensure enabledPlugins map exists with beads disabled (Gas Town standard)
-	if current.EnabledPlugins == nil {
-		current.EnabledPlugins = make(map[string]bool)
-	}
-	current.EnabledPlugins["beads@beads-marketplace"] = false
-
-	// Create .claude directory if needed
-	claudeDir := filepath.Dir(target.Path)
-	if err := os.MkdirAll(claudeDir, 0755); err != nil {
-		return 0, fmt.Errorf("creating .claude directory: %w", err)
-	}
-
-	// Write settings.json using MarshalSettings to preserve unknown fields
-	data, err := hooks.MarshalSettings(current)
-	if err != nil {
-		return 0, fmt.Errorf("marshaling settings: %w", err)
-	}
-	data = append(data, '\n')
-
-	if err := os.WriteFile(target.Path, data, 0644); err != nil {
-		return 0, fmt.Errorf("writing settings: %w", err)
-	}
-
-	if fileExists {
+	case hooks.SyncUpdated:
 		return syncUpdated, nil
+	case hooks.SyncUnchanged:
+		return syncUnchanged, nil
+	default:
+		return 0, fmt.Errorf("unknown sync result: %d", result)
 	}
-	return syncCreated, nil
 }

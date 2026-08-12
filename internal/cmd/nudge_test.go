@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +19,17 @@ func setupNudgeTestRegistry(t *testing.T) {
 	old := session.DefaultRegistry()
 	session.SetDefaultRegistry(reg)
 	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+}
+
+func TestNudgeHelpUsesTownRootMessagingConfig(t *testing.T) {
+	const want = "<town-root>/config/messaging.json"
+
+	if !strings.Contains(nudgeCmd.Long, want) {
+		t.Fatalf("help should document %q:\n%s", want, nudgeCmd.Long)
+	}
+	if strings.Contains(nudgeCmd.Long, "~/gt/config/messaging.json") {
+		t.Fatalf("help should not document the obsolete home-relative path:\n%s", nudgeCmd.Long)
+	}
 }
 
 func TestNudgeStdinConflict(t *testing.T) {
@@ -187,6 +200,16 @@ func TestSessionNameToAddress(t *testing.T) {
 			expected:    "gastown/alpha",
 		},
 		{
+			name:        "dog",
+			sessionName: "hq-dog-alpha",
+			expected:    "deacon/dogs/alpha",
+		},
+		{
+			name:        "hyphenated dog",
+			sessionName: "hq-dog-my-dog",
+			expected:    "deacon/dogs/my-dog",
+		},
+		{
 			name:        "unrecognized format",
 			sessionName: "plaintext",
 			expected:    "",
@@ -225,9 +248,9 @@ func TestNudgeInvalidMode(t *testing.T) {
 	nudgeMessageFlag = "test"
 
 	tests := []struct {
-		name     string
-		mode     string
-		wantErr  string
+		name    string
+		mode    string
+		wantErr string
 	}{
 		{"bogus mode", "bogus", `invalid --mode "bogus"`},
 		{"empty mode", "", `invalid --mode ""`},
@@ -303,6 +326,10 @@ func TestNudgeValidModesAccepted(t *testing.T) {
 		nudgeStdinFlag = origStdin
 		waitIdleTimeout = origTimeout
 	}()
+
+	// Route nudge transport to a log file so the test doesn't deliver "test"
+	// messages to live agents (mayor reported recurring synthetic nudges).
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
 
 	// Shorten wait-idle timeout to avoid 15s test delay
 	waitIdleTimeout = 200 * time.Millisecond
@@ -407,6 +434,30 @@ func TestPostQueueIdleRecovery_SkipsDeliveryWhenDrainEmpty(t *testing.T) {
 	}
 }
 
+func TestRequeueDrainedNudgesPreservesFailedDelivery(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-crew-test"
+	drained := []nudge.QueuedNudge{
+		{Sender: "test", Message: "first", Timestamp: time.Now().Add(-time.Second)},
+		{Sender: "test", Message: "second", Timestamp: time.Now()},
+	}
+
+	requeueDrainedNudges(townRoot, session, "test", drained)
+
+	got, err := nudge.Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(got) != len(drained) {
+		t.Fatalf("Drain got %d nudges, want %d", len(got), len(drained))
+	}
+	for i := range drained {
+		if got[i].Message != drained[i].Message || got[i].Sender != drained[i].Sender {
+			t.Fatalf("requeued[%d] = %#v, want %#v", i, got[i], drained[i])
+		}
+	}
+}
+
 func TestValidModeMapsMatchConstants(t *testing.T) {
 	// Ensure the validation maps cover all defined mode constants.
 	modes := []string{NudgeModeImmediate, NudgeModeQueue, NudgeModeWaitIdle}
@@ -441,6 +492,81 @@ func TestIdleWatcherPollInterval(t *testing.T) {
 	}
 	if idleWatcherPollInterval > 5*time.Second {
 		t.Errorf("idleWatcherPollInterval = %v, too slow (max 5s)", idleWatcherPollInterval)
+	}
+}
+
+func TestNudgeTrailingSlashNormalization(t *testing.T) {
+	// The mail system uses "mayor/" and "deacon/" as canonical addresses.
+	// runNudge must strip the trailing slash so these match the role shortcuts.
+	// Without normalization, "mayor/" falls through to parseAddress which
+	// rejects it ("invalid address format"), silently dropping the nudge.
+	origMode := nudgeModeFlag
+	origPriority := nudgePriorityFlag
+	origMessage := nudgeMessageFlag
+	origStdin := nudgeStdinFlag
+	origTimeout := waitIdleTimeout
+	defer func() {
+		nudgeModeFlag = origMode
+		nudgePriorityFlag = origPriority
+		nudgeMessageFlag = origMessage
+		nudgeStdinFlag = origStdin
+		waitIdleTimeout = origTimeout
+	}()
+
+	// Route nudge transport to a log file so this test doesn't deliver to
+	// the real mayor/deacon/witness/refinery sessions on host.
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+
+	waitIdleTimeout = 200 * time.Millisecond
+	nudgeStdinFlag = false
+	nudgeMessageFlag = "test"
+	nudgePriorityFlag = "normal"
+	nudgeModeFlag = NudgeModeImmediate
+
+	for _, target := range []string{"mayor/", "deacon/", "witness/", "refinery/"} {
+		t.Run(target, func(t *testing.T) {
+			err := runNudge(nudgeCmd, []string{target, "hello"})
+			// Will fail on tmux/session lookup, but must NOT fail on address parsing.
+			if err != nil && strings.Contains(err.Error(), "invalid address format") {
+				t.Errorf("trailing-slash target %q was rejected as invalid address: %v", target, err)
+			}
+		})
+	}
+}
+
+func TestNudgeDogTargetRoutesToDogSession(t *testing.T) {
+	origMode := nudgeModeFlag
+	origPriority := nudgePriorityFlag
+	origMessage := nudgeMessageFlag
+	origStdin := nudgeStdinFlag
+	origForce := nudgeForceFlag
+	defer func() {
+		nudgeModeFlag = origMode
+		nudgePriorityFlag = origPriority
+		nudgeMessageFlag = origMessage
+		nudgeStdinFlag = origStdin
+		nudgeForceFlag = origForce
+	}()
+
+	logPath := filepath.Join(t.TempDir(), "nudge.log")
+	t.Setenv("GT_TEST_NUDGE_LOG", logPath)
+
+	nudgeModeFlag = NudgeModeImmediate
+	nudgePriorityFlag = nudge.PriorityNormal
+	nudgeMessageFlag = "hello dog"
+	nudgeStdinFlag = false
+	nudgeForceFlag = true
+
+	if err := runNudge(nudgeCmd, []string{"deacon/dogs/fido"}); err != nil {
+		t.Fatalf("runNudge dog target returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("reading nudge log: %v", err)
+	}
+	if got, want := string(data), "nudge:hq-dog-fido:"; !strings.Contains(got, want) {
+		t.Fatalf("nudge log = %q, want containing %q", got, want)
 	}
 }
 

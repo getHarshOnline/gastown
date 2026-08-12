@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -179,10 +178,8 @@ exit 0
 	}
 	logContent := string(logBytes)
 
-	// The first line starting with CMD: is the create command (NUL-delimited args).
-	// Check for --labels=gt:owned anywhere in the logged content for the create call.
-	if !strings.Contains(logContent, "--labels=gt:owned") {
-		t.Errorf("create command missing --labels=gt:owned in log:\n%q", logContent)
+	if !strings.Contains(logContent, "--labels=gt:convoy,gt:owned") {
+		t.Errorf("create command missing convoy/owned labels in log:\n%q", logContent)
 	}
 }
 
@@ -467,9 +464,9 @@ shift || true
 
 case "$cmd" in
   sql)
-    # bdDepListRawIDs up: SELECT issue_id FROM dependencies WHERE depends_on_id = '<beadID>' AND type = 'tracks'
+    # bdDepListRawIDs up: match beadID against typed dependency target columns.
     case "$*" in
-      *"depends_on_id = 'gt-bbb'"*)
+      *"depends_on_issue_id = 'gt-bbb'"*)
         echo '[{"issue_id":"hq-cv-existing"}]'
         ;;
       *)
@@ -692,9 +689,9 @@ func TestResolveRigFromBeadIDs_TownLevelPrefix_Errors(t *testing.T) {
 	}
 }
 
-// TestBatchSling_EmptyConvoyCleanupOnAllFailures verifies that when all beads
-// fail to sling, the empty convoy is closed with a cleanup reason.
-func TestBatchSling_EmptyConvoyCleanupOnAllFailures(t *testing.T) {
+// TestCloseConvoyPinsTownDatabaseUnderStaleEnv verifies convoy cleanup closes
+// hq-cv-* beads through the town database even when ambient bd env points away.
+func TestCloseConvoyPinsTownDatabaseUnderStaleEnv(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows")
 	}
@@ -705,9 +702,15 @@ func TestBatchSling_EmptyConvoyCleanupOnAllFailures(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"type":"town","name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
 	townBeads := filepath.Join(townRoot, ".beads")
 	if err := os.MkdirAll(townBeads, 0755); err != nil {
 		t.Fatalf("mkdir .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townBeads, "metadata.json"), []byte(`{"dolt_database":"hq","dolt_server_host":"127.0.0.1","dolt_server_port":3307}`), 0644); err != nil {
+		t.Fatalf("write metadata: %v", err)
 	}
 
 	closeLogPath := filepath.Join(townRoot, "bd-close.log")
@@ -720,11 +723,11 @@ if [ "$cmd" = "--allow-stale" ]; then
   cmd="$1"
 fi
 shift || true
-case "$cmd" in
-  close)
-    echo "$cmd $*" >> "` + closeLogPath + `"
-    exit 0
-    ;;
+	case "$cmd" in
+	  close)
+	    printf '%s %s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$cmd" "$*" "$(pwd)" "${BEADS_DIR:-}" "${BEADS_DOLT_SERVER_DATABASE:-}" "${BEADS_DB:-}" "${BD_DB:-}" "${BEADS_DOLT_DATA_DIR:-}" "${GT_DOLT_DATA:-}" "${BD_DOLT_AUTO_COMMIT:-}" "${BD_READONLY:-}" >> "` + closeLogPath + `"
+	    exit 0
+	    ;;
 esac
 exit 0
 `
@@ -734,20 +737,26 @@ exit 0
 	}
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	t.Setenv("BEADS_DIR", filepath.Join(townRoot, "wrong", ".beads"))
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "gastown")
+	t.Setenv("BEADS_DB", filepath.Join(townRoot, "wrong.db"))
+	t.Setenv("BD_DB", filepath.Join(townRoot, "wrong.bd"))
+	t.Setenv("BEADS_DOLT_DATA_DIR", filepath.Join(townRoot, "wrong-data"))
+	t.Setenv("GT_DOLT_DATA", filepath.Join(townRoot, "wrong-gt-data"))
+	t.Setenv("BD_READONLY", "true")
+	t.Setenv("BD_DOLT_AUTO_COMMIT", "off")
 
-	// Simulate the cleanup logic from runBatchSling:
-	// If successCount == 0 and batchConvoyID is set, close the convoy.
-	successCount := 0
-	batchConvoyID := "hq-cv-cleanup-test"
-
-	if successCount == 0 && batchConvoyID != "" {
-		// Mirror the exact exec.Command call from sling_batch.go:303
-		cmd := exec.Command("bd", "close", batchConvoyID, "-r", "all beads failed to sling")
-		cmd.Dir = townBeads
-		if err := cmd.Run(); err != nil {
-			t.Fatalf("close convoy: %v", err)
-		}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
 	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	batchConvoyID := "hq-cv-cleanup-test"
+	closeConvoy(batchConvoyID, "all beads failed to sling")
 
 	// Verify close was called
 	closeBytes, err := os.ReadFile(closeLogPath)
@@ -760,6 +769,31 @@ exit 0
 	}
 	if !strings.Contains(closeContent, "all beads failed") {
 		t.Errorf("close log should contain failure reason:\n%s", closeContent)
+	}
+	fields := strings.Split(strings.TrimSpace(closeContent), "|")
+	if len(fields) != 10 {
+		t.Fatalf("close log fields = %v, want 10 fields in %q", fields, closeContent)
+	}
+	if fields[1] != townBeads {
+		t.Fatalf("close cwd = %q, want town beads dir %q", fields[1], townBeads)
+	}
+	if fields[2] != townBeads {
+		t.Fatalf("BEADS_DIR = %q, want %q", fields[2], townBeads)
+	}
+	if fields[3] != "hq" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want hq", fields[3])
+	}
+	if fields[4] != "" || fields[5] != "" || fields[6] != "" {
+		t.Fatalf("stale DB env should be stripped, got BEADS_DB=%q BD_DB=%q BEADS_DOLT_DATA_DIR=%q", fields[4], fields[5], fields[6])
+	}
+	if fields[7] != "" {
+		t.Fatalf("GT_DOLT_DATA should be stripped, got %q", fields[7])
+	}
+	if fields[8] != "on" {
+		t.Fatalf("BD_DOLT_AUTO_COMMIT = %q, want on", fields[8])
+	}
+	if fields[9] != "" {
+		t.Fatalf("BD_READONLY should be stripped, got %q", fields[9])
 	}
 }
 
@@ -859,7 +893,8 @@ func setupTownWithBdStub(t *testing.T, bdScript string) (townRoot, logPath strin
 }
 
 // TestCreateAutoConvoy_BasicSuccess verifies that createAutoConvoy creates a
-// convoy with "Work: <title>" title, adds a tracking dep, and returns hq-cv-* ID.
+// convoy with "Work: <title>" title, delegates tracking to the helper, and
+// returns an hq-cv-* ID.
 func TestCreateAutoConvoy_BasicSuccess(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows")
@@ -877,6 +912,16 @@ exit 0
 	if err := os.WriteFile(filepath.Join(townRoot, "bin", "bd"), []byte(bdScript), 0755); err != nil {
 		t.Fatalf("rewrite bd stub: %v", err)
 	}
+
+	var helperTownRoot, helperConvoyID, helperBeadID string
+	oldAddTracking := addTrackingRelationFn
+	addTrackingRelationFn = func(townRoot, convoyID, issueID string) error {
+		helperTownRoot = townRoot
+		helperConvoyID = convoyID
+		helperBeadID = issueID
+		return nil
+	}
+	t.Cleanup(func() { addTrackingRelationFn = oldAddTracking })
 
 	convoyID, err := createAutoConvoy("gt-aaa", "Fix the widget", false, "mr", "")
 	if err != nil {
@@ -898,12 +943,14 @@ exit 0
 		t.Errorf("create should include 'Work: Fix the widget' in args:\n%s", logContent)
 	}
 
-	// Verify dep add was called
-	if !strings.Contains(logContent, "dep add") {
-		t.Errorf("expected dep add command in log:\n%s", logContent)
+	if helperTownRoot != townRoot {
+		t.Errorf("tracking helper townRoot = %q, want %q", helperTownRoot, townRoot)
 	}
-	if !strings.Contains(logContent, "gt-aaa") {
-		t.Errorf("dep add should reference gt-aaa:\n%s", logContent)
+	if helperConvoyID != convoyID {
+		t.Errorf("tracking helper convoyID = %q, want %q", helperConvoyID, convoyID)
+	}
+	if helperBeadID != "gt-aaa" {
+		t.Errorf("tracking helper issueID = %q, want %q", helperBeadID, "gt-aaa")
 	}
 }
 
@@ -946,14 +993,17 @@ exit 0
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
-	if !strings.Contains(string(logBytes), "--labels=gt:owned") {
-		t.Errorf("create should include --labels=gt:owned:\n%q", string(logBytes))
+	if !strings.Contains(string(logBytes), "--labels=gt:convoy,gt:owned") {
+		t.Errorf("create should include convoy/owned labels:\n%q", string(logBytes))
 	}
 }
 
-// TestCreateAutoConvoy_DepFailCleansUpOrphan verifies that when the dep add
-// fails, the convoy is closed to prevent orphans.
-func TestCreateAutoConvoy_DepFailCleansUpOrphan(t *testing.T) {
+// TestCreateAutoConvoy_DepFailIsNonFatal verifies that when the dep add fails
+// (e.g., cross-rig bead), createAutoConvoy succeeds with a warning rather than
+// returning an error. Tracking failure is non-fatal since commit 103b6aaa because
+// beads v0.62 removed cross-rig routing from bd dep add. The convoy still works
+// without the tracking dep — witness and daemon provide backup tracking.
+func TestCreateAutoConvoy_DepFailIsNonFatal(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows")
 	}
@@ -973,9 +1023,6 @@ case "$cmd" in
   dep)
     exit 1
     ;;
-  close)
-    exit 0
-    ;;
 esac
 exit 0
 `
@@ -985,25 +1032,25 @@ exit 0
 		t.Fatalf("rewrite bd stub: %v", err)
 	}
 
-	_, err := createAutoConvoy("gt-aaa", "My task", false, "", "")
-	if err == nil {
-		t.Fatal("expected error when dep add fails, got nil")
+	convoyID, err := createAutoConvoy("gt-aaa", "My task", false, "", "")
+	if err != nil {
+		t.Fatalf("expected no error (dep fail is non-fatal), got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "tracking relation") {
-		t.Errorf("error should mention tracking relation, got: %v", err)
+	if convoyID == "" {
+		t.Fatal("expected non-empty convoy ID")
 	}
 
-	// Verify close was called (orphan cleanup)
+	// Verify create was called but close was NOT called (convoy is not orphaned)
 	logBytes, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
 	logContent := string(logBytes)
-	if !strings.Contains(logContent, "CMD:close") {
-		t.Errorf("expected close command for orphan cleanup:\n%s", logContent)
+	if !strings.Contains(logContent, "CMD:create") {
+		t.Errorf("expected create command in log:\n%s", logContent)
 	}
-	if !strings.Contains(logContent, "tracking dep failed") {
-		t.Errorf("close should include 'tracking dep failed' reason:\n%s", logContent)
+	if strings.Contains(logContent, "CMD:close") {
+		t.Errorf("close should NOT be called (dep fail is non-fatal):\n%s", logContent)
 	}
 }
 

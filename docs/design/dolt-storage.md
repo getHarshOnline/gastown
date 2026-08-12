@@ -32,8 +32,26 @@ Dolt SQL Server (one per town, port 3307)
 **Data directory**: `~/gt/.dolt-data/` — each subdirectory is a database
 accessible via `USE <name>` in SQL.
 
-**Connection**: `root@tcp(127.0.0.1:3307)/<database>` (no password for
-localhost).
+**Connection**: `root@tcp(<host>:3307)/<database>` (no password).
+
+## Environment Variables
+
+gt and bd use separate env vars for Dolt connection. gt automatically
+translates its variables to bd's equivalents when spawning agents.
+
+| gt (Gas Town) | bd (Beads) | Purpose |
+|---------------|------------|---------|
+| `GT_DOLT_HOST` | `BEADS_DOLT_SERVER_HOST` | Server host (bd defaults to `127.0.0.1` if unset) |
+| `GT_DOLT_PORT` | `BEADS_DOLT_PORT` | Server port (default: `3307`) |
+
+**Remote Dolt servers**: If Dolt runs on a different machine (e.g., over
+Tailscale), set `GT_DOLT_HOST` in the environment. gt propagates this as
+`BEADS_DOLT_SERVER_HOST` to all bd subprocesses, overriding bd's hardcoded
+`127.0.0.1` default. Without this, every new rig/worktree/polecat silently
+connects to localhost and fails.
+
+Per-workspace override: set `dolt.host` in a rig's `.beads/config.yaml`.
+This takes priority over the env var for that specific workspace.
 
 ## Commands
 
@@ -53,6 +71,22 @@ gt dolt list           # List all databases
 
 If the server isn't running, `bd` fails fast with a clear message
 pointing to `gt dolt start`.
+
+## Gas Town Scope vs `bd --global`
+
+Gas Town's town-level beads are the `hq` database. Access them by running
+direct `bd` commands from the town root (`~/gt`) or with `bd -C ~/gt ...`.
+Direct `bd` commands from rig worktrees use that rig's `.beads` redirect and
+database, so do not assume an `hq-*` ID will retarget the command.
+
+Do not use `bd --global` for Gas Town town beads. In Beads, `--global`
+means the standalone shared-server database named `beads_global`; it does
+not mean Gas Town's `hq` database, and `BEADS_DOLT_DATABASE=hq` does not
+retarget `--global`.
+
+For Gas Town Dolt health, use `gt dolt status`. `bd dolt status` reports
+the Beads client/runtime view and can say no Beads-managed server is running
+even when the Gas Town Dolt server on port 3307 is healthy.
 
 ## Write Concurrency: All-on-Main
 
@@ -205,9 +239,9 @@ but insufficient. DELETE + rebase + gc is the full pipeline.
 
 **Critical update** (Tim Sehn, 2026-02-28): All compaction operations —
 `DOLT_RESET --soft`, `DOLT_REBASE()`, `dolt_gc()` — are **safe on a
-running server**. No downtime or maintenance window is needed. Auto-GC
-has been ON by default since Dolt 1.75.0. Flatten is trivially cheap
-(pointer moves, not data writes). Can run daily or more frequently.
+running server**. Routine compaction does not need downtime. Auto-GC has
+been ON by default since Dolt 1.75.0. Flatten is trivially cheap (pointer
+moves, not data writes). Can run daily or more frequently.
 
 Reference: https://www.dolthub.com/blog/2026-01-28-everybody-rebase/
 
@@ -359,6 +393,19 @@ first, gc second.
 **Automatic GC is ON by default** since Dolt 1.75.0 (October 2025). It
 triggers when the journal file (`.dolt/noms/vvvv...`) reaches 50MB. No
 manual gc or server stop is required — the server handles it.
+
+Gas Town managed Dolt configs should keep `auto_gc_behavior` enabled with
+`archive_level: 1` so the sql-server does not retain every old chunk index
+and grow RSS indefinitely. The config is regenerated only when the managed
+Dolt server starts; a deployed change takes effect on the next Dolt restart.
+Set `GT_DOLT_AUTO_GC=off` before that restart to emit `enable: false` and
+`archive_level: 0` as an operational rollback switch.
+
+If auto-GC was disabled long enough for a database to bloat, schedule one
+explicit `dolt gc --full --archive-level=1` in a maintenance window to reset
+the storage/RSS baseline. That one-time reclaim is an operator action, not a
+hidden daemon task; after it completes, auto-GC handles ongoing chunk
+reclamation.
 
 ```sql
 -- Manual gc (safe on a running server, no need to stop)

@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
@@ -105,7 +106,7 @@ Role shortcuts (expand to session names):
 
 Channel syntax:
   channel:<name>  Nudges all members of a named channel defined in
-                  ~/gt/config/messaging.json under "nudge_channels".
+                  <town-root>/config/messaging.json under "nudge_channels".
                   Patterns like "gastown/polecats/*" are expanded.
 
 DND (Do Not Disturb):
@@ -155,6 +156,20 @@ var idleWatcherPollInterval = 1 * time.Second
 // For "queue" mode: writes to the nudge queue for cooperative delivery.
 // For "wait-idle" mode: waits for idle, then delivers or falls back to queue.
 func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
+	// Test hook: when GT_TEST_NUDGE_LOG is set, log the nudge instead of
+	// delivering through real tmux/queue transport. Prevents test-suite
+	// runs from delivering "test" messages to live agents (mayor reported
+	// recurring synthetic nudges traced to nudge_test.go invocations).
+	// Mirrors the pattern in sling_helpers.go's nudgeWitness/nudgeRefinery.
+	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" {
+		entry := fmt.Sprintf("nudge:%s:%s:%s\n", sessionName, sender, message)
+		if f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			_, _ = f.WriteString(entry)
+			_ = f.Close()
+		}
+		return nil
+	}
+
 	townRoot, _ := workspace.FindFromCwd()
 
 	// Use the requested mode, but force queue mode for ACP sessions.
@@ -206,7 +221,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 						Message:  message,
 						Priority: nudgePriorityFlag,
 					}})
-					return t.NudgeSession(sessionName, formatted)
+					return t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot})
 				}
 				// Ensure a nudge-poller is running so the queue actually drains.
 				// The poller is normally started by gt crew start, but if the
@@ -230,7 +245,19 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 				Message:  message,
 				Priority: nudgePriorityFlag,
 			}})
-			return t.NudgeSession(sessionName, formatted)
+			deliverErr := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot})
+			if !errors.Is(deliverErr, tmux.ErrSubmitNotVerified) {
+				return deliverErr
+			}
+			fmt.Fprintf(os.Stderr, "wait-idle: %v; queueing for %s\n", deliverErr, sessionName)
+			if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+				Sender:   sender,
+				Message:  message,
+				Priority: nudgePriorityFlag,
+			}); qErr != nil {
+				return fmt.Errorf("queue fallback after unverified submit failed: %v (original: %w)", qErr, deliverErr)
+			}
+			return nil
 		}
 		// Terminal errors (session gone, no server) — propagate, don't queue.
 		// Queueing a nudge for a dead session means it will never be delivered.
@@ -253,7 +280,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 				Message:  message,
 				Priority: nudgePriorityFlag,
 			}})
-			return t.NudgeSession(sessionName, formatted)
+			return t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot})
 		}
 		// Run watcher synchronously: polls for idle over a longer window.
 		// The UserPromptSubmit hook drains the queue on agent input, but an
@@ -265,7 +292,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		return nil
 
 	default: // NudgeModeImmediate
-		opts := tmux.NudgeOpts{}
+		opts := tmux.NudgeOpts{TownRoot: townRoot}
 		// Check if the target agent uses Escape as cancel (e.g., Gemini CLI).
 		// For these agents, skip the Escape keystroke to avoid canceling
 		// in-flight generation. (GH#gt-wasn)
@@ -322,13 +349,20 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 				return
 			}
 			formatted := nudge.FormatForInjection(drained)
-			if err := t.NudgeSession(sessionName, formatted); err != nil {
+			if err := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
 				fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
+				requeueDrainedNudges(townRoot, sessionName, "idle-watcher", drained)
 			}
 			return
 		}
 	}
 	// Timeout — nudge stays in queue for next watcher or manual drain.
+}
+
+func requeueDrainedNudges(townRoot, sessionName, source string, drained []nudge.QueuedNudge) {
+	if err := nudge.Requeue(townRoot, sessionName, drained); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: requeue for %s failed: %v\n", source, sessionName, err)
+	}
 }
 
 // validNudgeModes is the set of allowed --mode values.
@@ -378,6 +412,12 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	target := args[0]
+
+	// Normalize trailing slash: the mail system uses "mayor/" and "deacon/"
+	// as canonical addresses, but nudge role shortcuts expect bare names.
+	// Without this, "mayor/" falls through to parseAddress which rejects
+	// the empty second component, silently dropping the nudge.
+	target = strings.TrimSuffix(target, "/")
 
 	// Handle --stdin: read message from stdin (avoids shell quoting issues)
 	if nudgeStdinFlag {
@@ -498,6 +538,32 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		}
 		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", constants.RoleDeacon, message))
 		return nil
+	}
+	if dogName, ok := mail.DogAddressName(target); ok {
+		sessionName := session.DogSessionName(dogName)
+		if nudgeModeFlag != NudgeModeImmediate && !hasACPSessionByName(townRoot, sessionName) {
+			exists, err := t.HasSession(sessionName)
+			if err != nil {
+				return fmt.Errorf("checking dog session: %w", err)
+			}
+			if !exists {
+				return fmt.Errorf("session %q not found (cannot queue nudge for nonexistent session)", sessionName)
+			}
+		}
+
+		if err := deliverNudge(t, sessionName, message, sender); err != nil {
+			return fmt.Errorf("nudging dog: %w", err)
+		}
+
+		fmt.Printf("%s Nudged %s (%s)\n", style.Bold.Render("✓"), target, nudgeModeFlag)
+		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+			_ = LogNudge(townRoot, target, message)
+		}
+		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", target, message))
+		return nil
+	}
+	if strings.HasPrefix(target, constants.RoleMayor+"/") || strings.HasPrefix(target, constants.RoleDeacon+"/") {
+		return fmt.Errorf("invalid town target %q", target)
 	}
 
 	// Check if target is rig/polecat format or raw session name
@@ -829,6 +895,8 @@ func sessionNameToAddress(sessionName string) string {
 		return constants.RoleMayor
 	case session.RoleDeacon:
 		return constants.RoleDeacon
+	case session.RoleDog:
+		return mail.DogAddress(identity.Name)
 	case session.RoleWitness:
 		return fmt.Sprintf("%s/witness", identity.Rig)
 	case session.RoleRefinery:
@@ -851,12 +919,18 @@ func sessionNameToAddress(sessionName string) string {
 //
 // Returns empty string if the address cannot be converted.
 func addressToAgentBeadID(address string) string {
+	if dogName, ok := mail.DogAddressName(address); ok {
+		return session.DogSessionName(dogName)
+	}
 	// Handle special cases
 	switch address {
-	case constants.RoleMayor:
+	case constants.RoleMayor, constants.RoleMayor + "/":
 		return session.MayorSessionName()
-	case constants.RoleDeacon:
+	case constants.RoleDeacon, constants.RoleDeacon + "/":
 		return session.DeaconSessionName()
+	}
+	if strings.HasPrefix(address, constants.RoleMayor+"/") || strings.HasPrefix(address, constants.RoleDeacon+"/") {
+		return ""
 	}
 
 	// Parse rig/role format

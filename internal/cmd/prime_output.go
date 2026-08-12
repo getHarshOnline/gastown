@@ -1,9 +1,9 @@
 package cmd
 
 import (
-	"github.com/steveyegge/gastown/internal/cli"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,12 +11,16 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/checkpoint"
+	"github.com/steveyegge/gastown/internal/cli"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
+	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/templates"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -60,14 +64,7 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 	// Get town name for session names
 	townName, _ := workspace.GetTownName(ctx.TownRoot)
 
-	// Get default branch from rig config (default to "main" if not set)
-	defaultBranch := "main"
-	if ctx.Rig != "" && ctx.TownRoot != "" {
-		rigPath := filepath.Join(ctx.TownRoot, ctx.Rig)
-		if rigCfg, err := rig.LoadRigConfig(rigPath); err == nil && rigCfg.DefaultBranch != "" {
-			defaultBranch = rigCfg.DefaultBranch
-		}
-	}
+	defaultBranch, isForkRig, upstreamURL := roleRigContext(ctx)
 
 	data := templates.RoleData{
 		Role:          roleName,
@@ -76,6 +73,8 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 		TownName:      townName,
 		WorkDir:       ctx.WorkDir,
 		DefaultBranch: defaultBranch,
+		IsForkRig:     isForkRig,
+		UpstreamURL:   upstreamURL,
 		Polecat:       ctx.Polecat,
 		DogName:       ctx.Polecat, // ctx.Polecat holds the dog name for RoleDog
 		MayorSession:  session.MayorSessionName(),
@@ -90,6 +89,88 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 
 	fmt.Print(output)
 	return output, nil
+}
+
+func roleRigContext(ctx RoleContext) (defaultBranch string, isForkRig bool, upstreamURL string) {
+	defaultBranch = "main"
+	if ctx.Rig == "" || ctx.TownRoot == "" {
+		return defaultBranch, false, ""
+	}
+	rigPath := filepath.Join(ctx.TownRoot, ctx.Rig)
+	rigCfg, err := rig.LoadRigConfig(rigPath)
+	if err != nil || rigCfg == nil {
+		return defaultBranch, false, ""
+	}
+	if rigCfg.DefaultBranch != "" {
+		defaultBranch = rigCfg.DefaultBranch
+	}
+	if strings.TrimSpace(rigCfg.UpstreamURL) != "" {
+		return defaultBranch, true, util.RedactURL(rigCfg.UpstreamURL)
+	}
+	return defaultBranch, false, ""
+}
+
+// outputRoleDirectives loads and emits operator-provided role directives.
+// These come from the directive file layout (town-level and/or rig-level)
+// and override formula defaults where they conflict.
+//
+// w and explainEnabled are injected so tests can capture output without
+// mutating os.Stdout or the primeExplain global (avoiding data races
+// under t.Parallel).
+func outputRoleDirectives(ctx RoleContext, w io.Writer, explainEnabled bool) {
+	role := string(ctx.Role)
+	townRoot := ctx.TownRoot
+	rigName := ctx.Rig
+
+	townPath := filepath.Join(townRoot, "directives", role+".md")
+	rigPath := ""
+	if rigName != "" {
+		rigPath = filepath.Join(townRoot, rigName, "directives", role+".md")
+	}
+
+	explainf := func(format string, args ...any) {
+		if explainEnabled {
+			fmt.Fprintf(w, "\n[EXPLAIN] "+format+"\n", args...)
+		}
+	}
+
+	content := config.LoadRoleDirective(role, townRoot, rigName)
+	if content == "" {
+		explainf("Role directives: no directive files found (checked %s", townPath)
+		if rigPath != "" {
+			explainf("Role directives: also checked %s", rigPath)
+		}
+		return
+	}
+
+	// Determine source label for the header
+	hasTown := false
+	hasRig := false
+	if data, err := os.ReadFile(townPath); err == nil { //nolint:gosec // G304: path is from trusted config
+		if s := strings.TrimSpace(string(data)); s != "" {
+			hasTown = true
+		}
+	}
+	if rigPath != "" {
+		if data, err := os.ReadFile(rigPath); err == nil { //nolint:gosec // G304: path is from trusted config
+			if s := strings.TrimSpace(string(data)); s != "" {
+				hasRig = true
+			}
+		}
+	}
+
+	explainf("Role directives: town=%v rig=%v (town=%s, rig=%s)", hasTown, hasRig, townPath, rigPath)
+
+	fmt.Fprintln(w)
+	if hasTown && hasRig {
+		fmt.Fprintln(w, "## Town & Rig Directives (operator policy — overrides formula where they conflict)")
+	} else if hasRig {
+		fmt.Fprintln(w, "## Rig Directives (operator policy — overrides formula where they conflict)")
+	} else {
+		fmt.Fprintln(w, "## Town Directives (operator policy — overrides formula where they conflict)")
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, content)
 }
 
 func outputPrimeContextFallback(ctx RoleContext) {
@@ -130,6 +211,15 @@ func outputMayorContext(ctx RoleContext) {
 	fmt.Println("## Hookable Mail")
 	fmt.Println("Mail can be hooked for ad-hoc instructions: `" + cli.Name() + " hook attach <mail-id>`")
 	fmt.Println("If mail is on your hook, read and execute its instructions (GUPP applies).")
+	fmt.Println()
+	fmt.Println("## Lifecycle Nudges (SLOT_OPEN)")
+	fmt.Println("When you receive a SLOT_OPEN nudge from the Witness, a polecat has completed")
+	fmt.Println("work and its slot is available. **Always verify via CLI before deciding action:**")
+	fmt.Println()
+	fmt.Println("1. Run `" + cli.Name() + " polecat list` to get ground truth on polecat state")
+	fmt.Println("2. Do NOT trust your in-context belief about polecat state — it may be stale")
+	fmt.Println("3. If slots are open and beads are queued: `" + cli.Name() + " sling <bead> <rig>`")
+	fmt.Println("4. Witness lifecycle events are authoritative — never second-guess them")
 	fmt.Println()
 	fmt.Println("## Startup")
 	fmt.Println("Check for handoff messages with 🤝 HANDOFF in subject - continue predecessor's work.")
@@ -193,7 +283,11 @@ func outputPolecatContext(ctx RoleContext) {
 	fmt.Println("- `" + cli.Name() + " mail inbox` - Check your inbox for work assignments")
 	fmt.Println("- `bd show <issue>` - View your assigned issue")
 	fmt.Println("- `bd close <issue>` - Mark issue complete")
-	fmt.Println("- `" + cli.Name() + " done` - Signal work ready for merge")
+	if _, isForkRig, _ := roleRigContext(ctx); isForkRig {
+		fmt.Println("- Fork rig: push to origin and use PR/no-merge workflow; do not submit upstream changes to MQ")
+	} else {
+		fmt.Println("- `" + cli.Name() + " done` - Signal work ready for merge")
+	}
 	fmt.Println()
 	fmt.Println("## Hookable Mail")
 	fmt.Println("Mail can be hooked for ad-hoc instructions: `" + cli.Name() + " hook attach <mail-id>`")
@@ -221,6 +315,9 @@ func outputCrewContext(ctx RoleContext) {
 	fmt.Println("- `bd ready` - Available issues")
 	fmt.Println("- `bd show <issue>` - View issue details")
 	fmt.Println("- `bd close <issue>` - Mark issue complete")
+	if _, isForkRig, _ := roleRigContext(ctx); isForkRig {
+		fmt.Println("- Fork rig: branch from upstream, push to origin, create PR against upstream")
+	}
 	fmt.Println()
 	fmt.Println("## Hookable Mail")
 	fmt.Println("Mail can be hooked for ad-hoc instructions: `" + cli.Name() + " hook attach <mail-id>`")
@@ -336,7 +433,7 @@ func outputCommandQuickReference(ctx RoleContext) {
 		fmt.Println("|------------|----------------|----------------|")
 		fmt.Printf("| Run triage | `%s boot triage` | ~~gt deacon heartbeat~~ (that's Deacon's job) |\n", c)
 		fmt.Printf("| Check Deacon health | `%s deacon status` | ~~gt status~~ (town-wide, not Deacon-specific) |\n", c)
-		fmt.Printf("| Nudge the Deacon | `%s nudge deacon \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
+		fmt.Printf("| Nudge the Deacon | `%s nudge deacon \"msg\"` | ~~tmux send-keys~~ (blocked; can stage unsubmitted input) |\n", c)
 	}
 
 	fmt.Println()
@@ -446,6 +543,20 @@ func outputStartupDirective(ctx RoleContext) {
 			fmt.Printf("Rig %s is %s. No patrol needed. Exit cleanly.\n", ctx.Rig, reason)
 			return
 		}
+		if stop, err := refinery.ActiveSafetyStop(ctx.TownRoot, ctx.Rig); err != nil {
+			fmt.Println()
+			fmt.Println("---")
+			fmt.Println()
+			style.PrintWarning("could not check refinery safety stop: %v", err)
+			fmt.Println("No patrol needed. Exit cleanly until safety-stop state can be verified.")
+			return
+		} else if stop != nil {
+			fmt.Println()
+			fmt.Println("---")
+			fmt.Println()
+			fmt.Printf("Refinery %s is %s. No patrol needed. Exit cleanly.\n", ctx.Rig, stop.Reason())
+			return
+		}
 		fmt.Println()
 		fmt.Println("---")
 		fmt.Println()
@@ -487,6 +598,22 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("5. Check for attached patrol: `" + cli.Name() + " hook`")
 		fmt.Println("   - If mol attached → **RUN IT** (resume from current step)")
 		fmt.Println("   - If no mol → create patrol: `bd mol wisp mol-deacon-patrol`")
+	case RoleDog:
+		fmt.Println()
+		fmt.Println("---")
+		fmt.Println()
+		fmt.Println("**STARTUP PROTOCOL**: You are a dog with NO WORK on your hook.")
+		fmt.Println()
+		fmt.Println("This likely means dispatch had a timing race (hook write not yet propagated).")
+		fmt.Println("Before going idle, try to recover work:")
+		fmt.Println()
+		fmt.Println("1. Check mail: `" + cli.Name() + " mail inbox` — dispatcher may have sent instructions")
+		fmt.Println("2. If mail has work → execute it")
+		fmt.Println("3. If no mail → check ready queue: `bd ready`")
+		fmt.Println("4. If ready queue has work → claim top bead: `bd update <id> --claim`")
+		fmt.Println("5. If nothing available → run `" + cli.Name() + " done` and exit")
+		fmt.Println()
+		fmt.Println("DO NOT sit idle waiting. Recover or terminate. (GH#2748)")
 	case RoleBoot:
 		fmt.Println()
 		fmt.Println("---")
@@ -563,7 +690,7 @@ func outputAttachmentStatus(ctx RoleContext) {
 
 	// Show inline formula steps if formula name is known, else fall back to bd mol current
 	if attachment.AttachedFormula != "" {
-		showFormulaStepsFull(attachment.AttachedFormula, strings.Split(attachment.FormulaVars, "\n"))
+		showFormulaStepsFull(attachment.AttachedFormula, ctx.TownRoot, ctx.Rig, attachmentFormulaVars(attachment))
 	} else {
 		showMoleculeExecutionPrompt(ctx.WorkDir, attachment.AttachedMolecule)
 	}

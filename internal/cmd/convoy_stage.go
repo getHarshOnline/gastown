@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -29,10 +29,15 @@ var convoyStageLaunch bool
 // or falls back to "Staged: N beads across M rigs".
 var convoyStageTitle string
 
+// convoyStageNoValidate disables automatic validation bead creation for epic input.
+var convoyStageNoValidate bool
+
 func init() {
 	convoyStageCmd.Flags().BoolVar(&convoyStageJSON, "json", false, "Output machine-readable JSON")
 	convoyStageCmd.Flags().BoolVar(&convoyStageLaunch, "launch", false, "Launch the convoy immediately after staging (transition to open)")
 	convoyStageCmd.Flags().StringVar(&convoyStageTitle, "title", "", "Human-readable title for the convoy (default: derived from epic title or auto-generated)")
+	convoyStageCmd.Flags().BoolVar(&convoyStageNoValidate, "no-validate", false, "Skip automatic validation bead creation (epic input only)")
+	convoyStageCmd.SetFlagErrorFunc(convoyStageFlagError)
 }
 
 // ---------------------------------------------------------------------------
@@ -41,14 +46,15 @@ func init() {
 
 // StageResult is the top-level JSON output for gt convoy stage --json.
 type StageResult struct {
-	Status   string          `json:"status"`    // "staged_ready", "staged_warnings", or "error"
-	ConvoyID string          `json:"convoy_id"` // empty if errors prevented creation
-	Restaged bool            `json:"restaged"`  // true if an existing convoy was updated in place
-	Errors   []FindingJSON   `json:"errors"`
-	Warnings []FindingJSON   `json:"warnings"`
-	Waves    []WaveJSON      `json:"waves"`
-	Gated    []GatedTaskJSON `json:"gated,omitempty"` // tasks blocked by open non-slingable nodes
-	Tree     []TreeNodeJSON  `json:"tree"`
+	Status           string          `json:"status"`                       // "staged_ready", "staged_warnings", or "error"
+	ConvoyID         string          `json:"convoy_id"`                    // empty if errors prevented creation
+	Restaged         bool            `json:"restaged"`                     // true if an existing convoy was updated in place
+	ValidationBeadID string          `json:"validation_bead_id,omitempty"` // capstone validation bead (epic input only)
+	Errors           []FindingJSON   `json:"errors"`
+	Warnings         []FindingJSON   `json:"warnings"`
+	Waves            []WaveJSON      `json:"waves"`
+	Gated            []GatedTaskJSON `json:"gated,omitempty"` // tasks blocked by open non-slingable nodes
+	Tree             []TreeNodeJSON  `json:"tree"`
 }
 
 // GatedTaskJSON is the JSON representation of a task gated by non-slingable blockers.
@@ -207,13 +213,57 @@ Three input forms:
   gt convoy stage <convoy-id>         Re-analyze an existing convoy's tracked beads
 
 The staged convoy can later be launched with 'gt convoy launch'.`,
-	Args: cobra.MinimumNArgs(1),
 	RunE: runConvoyStage,
 }
 
+func convoyStageFlagError(cmd *cobra.Command, err error) error {
+	if !convoyStageFlagEnabled(cmd) {
+		return err
+	}
+	if cmd != nil {
+		cmd.SilenceErrors = true
+		cmd.SilenceUsage = true
+	}
+	convoyStageJSON = true
+	return emitStageJSONError("validation", nil, err, nil, nil)
+}
+
+func convoyStageFlagEnabled(cmd *cobra.Command) bool {
+	if convoyStageJSON {
+		return true
+	}
+	if cmd == nil {
+		return argsRequestConvoyStageJSON(os.Args[1:])
+	}
+	jsonFlag, err := cmd.Flags().GetBool("json")
+	return err == nil && jsonFlag || argsRequestConvoyStageJSON(os.Args[1:])
+}
+
+func argsRequestConvoyStageJSON(args []string) bool {
+	for _, arg := range args {
+		if arg == "--json" {
+			return true
+		}
+		if strings.HasPrefix(arg, "--json=") {
+			value := strings.TrimPrefix(arg, "--json=")
+			parsed, err := strconv.ParseBool(value)
+			return err == nil && parsed
+		}
+	}
+	return false
+}
+
 func runConvoyStage(cmd *cobra.Command, args []string) error {
+	if cmd != nil {
+		cmd.SilenceErrors = convoyStageJSON
+		cmd.SilenceUsage = convoyStageJSON
+	}
+
 	// Step 1: Validate args.
 	if err := validateStageArgs(args); err != nil {
+		if convoyStageJSON {
+			return emitStageJSONError("validation", nil, err, nil, nil)
+		}
 		return err
 	}
 
@@ -223,15 +273,26 @@ func runConvoyStage(cmd *cobra.Command, args []string) error {
 	for _, arg := range args {
 		result, err := bdShow(arg)
 		if err != nil {
-			return fmt.Errorf("cannot resolve bead %s: %w", arg, err)
+			err = fmt.Errorf("cannot resolve bead %s: %w", arg, err)
+			if convoyStageJSON {
+				return emitStageJSONError("resolve", []string{arg}, err, nil, nil)
+			}
+			return err
 		}
-		beadTypes[arg] = result.IssueType
+		if isConvoyIssue(result.IssueType, result.Labels) {
+			beadTypes[arg] = "convoy"
+		} else {
+			beadTypes[arg] = result.IssueType
+		}
 		beadResults[arg] = result
 	}
 
 	// Step 3: Determine input kind.
 	input, err := resolveInputKind(beadTypes)
 	if err != nil {
+		if convoyStageJSON {
+			return emitStageJSONError("input", args, err, nil, nil)
+		}
 		return err
 	}
 
@@ -250,6 +311,9 @@ func runConvoyStage(cmd *cobra.Command, args []string) error {
 	// Step 4: Collect beads and deps.
 	beads, deps, err := collectBeads(input)
 	if err != nil {
+		if convoyStageJSON {
+			return emitStageJSONError("collect", input.IDs, err, nil, nil)
+		}
 		return err
 	}
 
@@ -263,10 +327,17 @@ func runConvoyStage(cmd *cobra.Command, args []string) error {
 		slingableIDs := dagSlingableIDs(dag)
 		overlaps, err := findOverlappingConvoys(slingableIDs)
 		if err != nil {
-			return fmt.Errorf("checking for overlapping convoys: %w", err)
+			err = fmt.Errorf("checking for overlapping convoys: %w", err)
+			if convoyStageJSON {
+				return emitStageJSONError("overlap", slingableIDs, err, dag, input)
+			}
+			return err
 		}
 		autoRestage, autoConvoyID, err := handleOverlappingConvoys(overlaps)
 		if err != nil {
+			if convoyStageJSON {
+				return emitStageJSONError("overlap", slingableIDs, err, dag, input)
+			}
 			return err
 		}
 		if autoRestage {
@@ -306,6 +377,20 @@ func runConvoyStage(cmd *cobra.Command, args []string) error {
 	waves, gated, err := computeWaves(dag)
 	if err != nil {
 		return err
+	}
+
+	// Step 11a: Append validation bead as final wave (epic input only).
+	if input.Kind == StageInputEpic && !convoyStageNoValidate {
+		epicID := input.IDs[0]
+		var validationID string
+		waves, validationID, err = appendValidationWave(dag, waves, epicID)
+		if err != nil {
+			return fmt.Errorf("creating validation bead: %w", err)
+		}
+		if validationID != "" && !convoyStageJSON {
+			blockerCount := len(dag.Nodes[validationID].BlockedBy)
+			fmt.Printf("Validation bead created: %s (blocked by %d tasks, formula: mol-validate-prd)\n", validationID, blockerCount)
+		}
 	}
 
 	// Step 11b: Add gated task warnings and recalculate status.
@@ -390,18 +475,24 @@ func runConvoyStageJSON(dag *ConvoyDAG, input *StageInput, errs, warns []Staging
 		result.Status = "error"
 		result.Waves = []WaveJSON{}
 
-		out, err := renderJSON(result)
-		if err != nil {
-			return err
-		}
-		fmt.Print(out)
-		return fmt.Errorf("convoy staging failed: %d error(s) found", len(errs))
+		return emitStageJSONResult(result, fmt.Errorf("convoy staging failed: %d error(s) found", len(errs)))
 	}
 
 	// No errors: compute waves and create/update convoy.
 	waves, gated, err := computeWaves(dag)
 	if err != nil {
-		return err
+		return emitStageJSONError("waves", nil, err, dag, input)
+	}
+
+	// Append validation bead as final wave (epic input only).
+	var validationBeadID string
+	if input.Kind == StageInputEpic && !convoyStageNoValidate {
+		epicID := input.IDs[0]
+		waves, validationBeadID, err = appendValidationWave(dag, waves, epicID)
+		if err != nil {
+			err = fmt.Errorf("creating validation bead: %w", err)
+			return emitStageJSONError("validation", []string{epicID}, err, dag, input)
+		}
 	}
 
 	// Add gated task warnings and recalculate status.
@@ -420,6 +511,7 @@ func runConvoyStageJSON(dag *ConvoyDAG, input *StageInput, errs, warns []Staging
 	}
 
 	result.Status = status
+	result.ValidationBeadID = validationBeadID
 	result.Waves = buildWavesJSON(waves, dag)
 	result.Gated = buildGatedJSON(gated, dag)
 
@@ -428,24 +520,19 @@ func runConvoyStageJSON(dag *ConvoyDAG, input *StageInput, errs, warns []Staging
 
 	if isRestage {
 		if err := updateStagedConvoy(restageConvoyID, dag, waves, status, title); err != nil {
-			return err
+			return emitStageJSONError("convoy", []string{restageConvoyID}, err, dag, input)
 		}
 		result.ConvoyID = restageConvoyID
 		result.Restaged = true
 	} else {
 		convoyID, err := createStagedConvoy(dag, waves, status, title)
 		if err != nil {
-			return err
+			return emitStageJSONError("convoy", nil, err, dag, input)
 		}
 		result.ConvoyID = convoyID
 	}
 
-	out, err := renderJSON(result)
-	if err != nil {
-		return err
-	}
-	fmt.Print(out)
-	return nil
+	return emitStageJSONResult(result, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -498,18 +585,9 @@ func findOverlappingConvoys(slingableIDs []string) ([]overlappingConvoy, error) 
 		return nil, err
 	}
 
-	// List all convoys (--all includes every status).
-	out, err := runBdJSON(townBeads, "list", "--type=convoy", "--all", "--json")
+	convoys, err := listConvoyIssues(townBeads, "", true)
 	if err != nil {
 		return nil, fmt.Errorf("listing convoys: %w", err)
-	}
-
-	var convoys []struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(out, &convoys); err != nil {
-		return nil, fmt.Errorf("parsing convoy list: %w", err)
 	}
 
 	// Build set of slingable IDs for fast lookup.
@@ -627,7 +705,7 @@ func resolveConvoyTitle(flagTitle string, input *StageInput, beadResults map[str
 
 // createStagedConvoy creates a convoy with the given staged status.
 // It generates a convoy ID, builds a title and description, then runs
-// `bd create` to create the convoy and `bd dep add` for each slingable bead.
+// `bd create` to create the convoy and typed tracking relations for each slingable bead.
 // Convoys live in the town HQ beads database (hq-cv-* prefix), so all bd
 // commands run against getTownBeadsDir(), matching gt convoy create behavior.
 // Returns the convoy ID.
@@ -683,10 +761,11 @@ func createStagedConvoy(dag *ConvoyDAG, waves []Wave, status string, title strin
 	// Create the convoy via bd create in town beads, then set status via bd update.
 	createArgs := []string{
 		"create",
-		"--type=convoy",
+		"--type=task",
 		"--id=" + convoyID,
 		"--title=" + title,
 		"--description=" + description,
+		"--labels=gt:convoy",
 	}
 	if beads.NeedsForceForID(convoyID) {
 		createArgs = append(createArgs, "--force")
@@ -696,18 +775,18 @@ func createStagedConvoy(dag *ConvoyDAG, waves []Wave, status string, title strin
 	}
 
 	// Set the staged status.
-	statusCmd := exec.Command("bd", "update", convoyID, "--status="+status)
-	statusCmd.Dir = townBeads
-	if out, err := statusCmd.CombinedOutput(); err != nil {
+	// Strip BEADS_DIR so bd discovers the correct database from Dir()
+	// rather than using an inherited (possibly wrong) override.
+	if out, err := BdCmd("update", convoyID, "--status="+status).
+		Dir(townBeads).StripBeadsDir().WithAutoCommit().
+		CombinedOutput(); err != nil {
 		return "", fmt.Errorf("bd update convoy status: %w\noutput: %s", err, out)
 	}
 
-	// Track each slingable bead via bd dep add.
+	// Track each slingable bead via the typed dependency helper.
 	for _, beadID := range slingableIDs {
-		if out, err := BdCmd("dep", "add", convoyID, beadID, "--type=tracks").
-			Dir(townBeads).WithAutoCommit().StripBeadsDir().
-			CombinedOutput(); err != nil {
-			return "", fmt.Errorf("bd dep add %s %s: %w\noutput: %s", convoyID, beadID, err, out)
+		if err := addTrackingRelationFn(townBeads, convoyID, beadID); err != nil {
+			printStageWarning("  Warning: could not track %s in convoy: %v\n", beadID, err)
 		}
 	}
 
@@ -742,10 +821,8 @@ func updateStagedConvoy(existingConvoyID string, dag *ConvoyDAG, waves []Wave, s
 	// Add new beads not currently tracked.
 	for _, id := range desiredIDs {
 		if !currentIDs[id] {
-			if out, err := BdCmd("dep", "add", existingConvoyID, id, "--type=tracks").
-				Dir(townBeads).WithAutoCommit().StripBeadsDir().
-				CombinedOutput(); err != nil {
-				return fmt.Errorf("bd dep add %s %s: %w\noutput: %s", existingConvoyID, id, err, out)
+			if err := addTrackingRelationFn(townBeads, existingConvoyID, id); err != nil {
+				printStageWarning("  Warning: could not track %s in convoy: %v\n", id, err)
 			}
 		}
 	}
@@ -753,10 +830,8 @@ func updateStagedConvoy(existingConvoyID string, dag *ConvoyDAG, waves []Wave, s
 	// Remove stale beads no longer in the DAG.
 	for id := range currentIDs {
 		if !desiredSet[id] {
-			if out, err := BdCmd("dep", "remove", existingConvoyID, id, "--type=tracks").
-				Dir(townBeads).WithAutoCommit().StripBeadsDir().
-				CombinedOutput(); err != nil {
-				return fmt.Errorf("bd dep remove %s %s: %w\noutput: %s", existingConvoyID, id, err, out)
+			if err := removeTrackingRelationFn(townBeads, existingConvoyID, id); err != nil {
+				printStageWarning("  Warning: could not untrack %s from convoy: %v\n", id, err)
 			}
 		}
 	}
@@ -1014,6 +1089,104 @@ func computeWaves(dag *ConvoyDAG) ([]Wave, []GatedTask, error) {
 	}
 
 	return waves, nil, nil
+}
+
+// appendValidationWave creates a validation bead blocked by all slingable beads
+// in the DAG and appends it as the final wave. The validation bead uses the
+// mol-validate-prd formula to ensure every swarm epic gets mandatory capstone
+// validation. Returns the updated waves and the validation bead ID.
+// Only called for epic input when --no-validate is not set.
+func appendValidationWave(dag *ConvoyDAG, waves []Wave, epicID string) ([]Wave, string, error) {
+	townBeads, err := getTownBeadsDir()
+	if err != nil {
+		return waves, "", err
+	}
+
+	// Collect all slingable bead IDs (these will block the validation bead).
+	var slingableIDs []string
+	for _, node := range dag.Nodes {
+		if isSlingableType(node.Type) {
+			slingableIDs = append(slingableIDs, node.ID)
+		}
+	}
+	sort.Strings(slingableIDs)
+
+	if len(slingableIDs) == 0 {
+		return waves, "", nil // nothing to validate
+	}
+
+	// Generate a validation bead ID.
+	validationID := fmt.Sprintf("hq-%s", generateShortID())
+
+	// Build the description with epic context and formula reference.
+	description := fmt.Sprintf(
+		"Capstone validation for epic %s. "+
+			"Run mol-validate-prd formula to validate PRD success criteria.\n\n"+
+			"formula: mol-validate-prd\nepic_id: %s",
+		epicID, epicID,
+	)
+
+	// Create the validation bead in town beads.
+	createArgs := []string{
+		"create",
+		"--type=task",
+		"--id=" + validationID,
+		"--title=Validate: PRD success criteria",
+		"--description=" + description,
+	}
+	if beads.NeedsForceForID(validationID) {
+		createArgs = append(createArgs, "--force")
+	}
+	if out, err := BdCmd(createArgs...).Dir(townBeads).WithAutoCommit().CombinedOutput(); err != nil {
+		return waves, "", fmt.Errorf("bd create validation bead: %w\noutput: %s", err, out)
+	}
+
+	// Set the validation bead as a child of the epic.
+	if out, err := BdCmd("dep", "add", epicID, validationID, "--type=parent-child").
+		Dir(townBeads).WithAutoCommit().StripBeadsDir().
+		CombinedOutput(); err != nil {
+		return waves, "", fmt.Errorf("bd dep add parent-child %s %s: %w\noutput: %s", epicID, validationID, err, out)
+	}
+
+	// Add blocking edges: every slingable bead blocks the validation bead.
+	// Cross-rig deps may fail (bd validates both IDs in same DB). Non-fatal.
+	for _, beadID := range slingableIDs {
+		if out, err := BdCmd("dep", "add", beadID, validationID, "--type=blocks").
+			Dir(townBeads).WithAutoCommit().StripBeadsDir().
+			CombinedOutput(); err != nil {
+			printStageWarning("  Warning: could not add blocking dep %s → %s: %v\n", beadID, validationID, err)
+			_ = out
+		}
+	}
+
+	// Add the validation bead to the DAG.
+	dag.Nodes[validationID] = &ConvoyDAGNode{
+		ID:        validationID,
+		Title:     "Validate: PRD success criteria",
+		Type:      "task",
+		Status:    "open",
+		BlockedBy: slingableIDs,
+		Parent:    epicID,
+	}
+
+	// Update the Blocks field of each slingable node.
+	for _, beadID := range slingableIDs {
+		if node, ok := dag.Nodes[beadID]; ok {
+			node.Blocks = append(node.Blocks, validationID)
+		}
+	}
+
+	// Append as the final wave.
+	nextWaveNum := 1
+	if len(waves) > 0 {
+		nextWaveNum = waves[len(waves)-1].Number + 1
+	}
+	waves = append(waves, Wave{
+		Number: nextWaveNum,
+		Tasks:  []string{validationID},
+	})
+
+	return waves, validationID, nil
 }
 
 // BeadInfo represents raw bead data from bd show output.
@@ -1291,10 +1464,11 @@ func buildGatedJSON(gated []GatedTask, dag *ConvoyDAG) []GatedTaskJSON {
 
 // bdShowResult matches the JSON output of `bd show <id> --json`.
 type bdShowResult struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Status    string `json:"status"`
-	IssueType string `json:"issue_type"`
+	ID        string   `json:"id"`
+	Title     string   `json:"title"`
+	Status    string   `json:"status"`
+	IssueType string   `json:"issue_type"`
+	Labels    []string `json:"labels"`
 }
 
 // bdDepResult matches the JSON output of `bd dep list <id> --json`.
@@ -1310,10 +1484,14 @@ type bdDepResult struct {
 // bd shell-out helpers
 // ---------------------------------------------------------------------------
 
+func runBdJSONForBead(beadID string, args ...string) ([]byte, error) {
+	return runBdJSON(resolveBeadDir(beadID), args...)
+}
+
 // bdShow runs `bd show <id> --json` and returns the parsed bead info.
 // Returns error if bd exits non-zero or returns no results.
 func bdShow(beadID string) (*bdShowResult, error) {
-	out, err := exec.Command("bd", "show", beadID, "--json").Output()
+	out, err := runBdJSONForBead(beadID, "show", beadID, "--json")
 	if err != nil {
 		return nil, fmt.Errorf("bd show %s: %w", beadID, err)
 	}
@@ -1333,7 +1511,7 @@ func bdShow(beadID string) (*bdShowResult, error) {
 // bd dep list returns the beads that <id> depends on. Each result's
 // DependsOnID is the dependency target; IssueID is set to <id> by this func.
 func bdDepList(beadID string) ([]bdDepResult, error) {
-	out, err := exec.Command("bd", "dep", "list", beadID, "--json").Output()
+	out, err := runBdJSONForBead(beadID, "dep", "list", beadID, "--json")
 	if err != nil {
 		return nil, fmt.Errorf("bd dep list %s: %w", beadID, err)
 	}
@@ -1355,20 +1533,22 @@ func bdDepList(beadID string) ([]bdDepResult, error) {
 // bd list is CWD-sensitive — it only searches the beads database in the current
 // directory. We resolve the correct .beads directory from the bead's prefix via
 // routes.jsonl so this works regardless of the caller's working directory.
+//
+// When the `--parent` index returns no rows, we fall back to a direct query
+// against the dependencies table (parent-child links) and resolve each child
+// via bdShow. This handles the case (GH #3700) where the index used by
+// `bd list --parent` doesn't see children that were added via `bd dep add ...
+// --type=parent-child`. The deps table is authoritative.
 func bdListChildren(parentID string) ([]bdShowResult, error) {
-	cmd := exec.Command("bd", "list", "--parent="+parentID, "--json")
-	if dir := beadsDirForID(parentID); dir != "" {
-		cmd.Dir = dir
-	}
-	out, err := cmd.Output()
+	out, err := runBdJSONForBead(parentID, "list", "--parent="+parentID, "--json")
 	if err != nil {
 		return nil, fmt.Errorf("bd list --parent=%s: %w", parentID, err)
 	}
 
-	// Handle empty output (no children).
+	// Handle empty output (no children) — try the deps-table fallback first.
 	trimmed := strings.TrimSpace(string(out))
 	if trimmed == "" || trimmed == "[]" {
-		return nil, nil
+		return bdListChildrenViaDeps(parentID)
 	}
 
 	var results []bdShowResult
@@ -1376,6 +1556,40 @@ func bdListChildren(parentID string) ([]bdShowResult, error) {
 		return nil, fmt.Errorf("bd list --parent=%s: parse JSON: %w (raw: %s)", parentID, err, out)
 	}
 
+	return results, nil
+}
+
+// bdListChildrenViaDeps resolves children by querying the dependencies table
+// directly for parent-child links, then loading each child via bdShow.
+//
+// Used as a fallback when `bd list --parent=<id>` returns empty even though
+// children exist (GH #3700). Returns nil (not an error) when the prefix can't
+// be resolved or no parent-child deps exist.
+func bdListChildrenViaDeps(parentID string) ([]bdShowResult, error) {
+	beadsDir := beadsDirForID(parentID)
+	if beadsDir == "" {
+		// Can't resolve the rig; nothing more we can do.
+		return nil, nil
+	}
+
+	// Production data stores parent-child as a typed dependency target where
+	// issue_id=parent. "down" returns target rows for the epic's children.
+	childIDs, err := bdDepListRawIDs(beadsDir, parentID, "down", "parent-child")
+	if err != nil {
+		return nil, nil // best-effort — caller still gets the empty primary result
+	}
+	if len(childIDs) == 0 {
+		return nil, nil
+	}
+
+	results := make([]bdShowResult, 0, len(childIDs))
+	for _, id := range childIDs {
+		child, err := bdShow(id)
+		if err != nil || child == nil {
+			continue
+		}
+		results = append(results, *child)
+	}
 	return results, nil
 }
 
@@ -1421,7 +1635,7 @@ func beadsDirForID(beadID string) string {
 // collectBeads gathers all beads for staging based on the input kind.
 // For epic input: recursively walks parent-child tree via bd list --parent=<id> --json
 // For task list input: validates each bead exists via bd show <id> --json
-// For convoy input: reads tracked beads via bd dep list <id> --type=tracks --json
+// For convoy input: reads tracked beads via typed dependency target columns.
 // Returns BeadInfo slice and DepInfo slice for all collected beads.
 func collectBeads(input *StageInput) ([]BeadInfo, []DepInfo, error) {
 	switch input.Kind {
@@ -1979,6 +2193,73 @@ func renderJSON(result StageResult) (string, error) {
 		return "", fmt.Errorf("marshal JSON: %w", err)
 	}
 	return string(data) + "\n", nil
+}
+
+func emitStageJSONError(category string, beadIDs []string, err error, dag *ConvoyDAG, input *StageInput) error {
+	if err == nil {
+		err = fmt.Errorf("convoy staging failed")
+	}
+	if category == "" {
+		category = "error"
+	}
+	ids := make([]string, 0, len(beadIDs))
+	ids = append(ids, beadIDs...)
+
+	result := StageResult{
+		Status: "error",
+		Errors: []FindingJSON{{
+			Category: category,
+			BeadIDs:  ids,
+			Message:  err.Error(),
+		}},
+		Warnings: []FindingJSON{},
+		Waves:    []WaveJSON{},
+		Tree:     []TreeNodeJSON{},
+	}
+	if dag != nil && input != nil {
+		result.Tree = buildTreeJSON(dag, input)
+	}
+
+	return emitStageJSONResult(result, err)
+}
+
+func emitStageJSONResult(result StageResult, returnErr error) error {
+	if result.Errors == nil {
+		result.Errors = []FindingJSON{}
+	}
+	if result.Warnings == nil {
+		result.Warnings = []FindingJSON{}
+	}
+	if result.Waves == nil {
+		result.Waves = []WaveJSON{}
+	}
+	if result.Tree == nil {
+		result.Tree = []TreeNodeJSON{}
+	}
+	for i := range result.Errors {
+		if result.Errors[i].BeadIDs == nil {
+			result.Errors[i].BeadIDs = []string{}
+		}
+	}
+	for i := range result.Warnings {
+		if result.Warnings[i].BeadIDs == nil {
+			result.Warnings[i].BeadIDs = []string{}
+		}
+	}
+
+	out, err := renderJSON(result)
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return returnErr
+}
+
+func printStageWarning(format string, args ...any) {
+	if convoyStageJSON {
+		return
+	}
+	fmt.Printf(format, args...)
 }
 
 // buildFindingsJSON converts StagingFinding slices to FindingJSON slices.

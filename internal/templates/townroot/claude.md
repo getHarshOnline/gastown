@@ -18,20 +18,27 @@ Symptoms: `bd` commands hang/timeout, "connection refused", "database not found"
 query latency > 5s, unexpected empty results.
 
 **BEFORE restarting Dolt, collect diagnostics.** Dolt hangs are hard to
-reproduce. A blind restart destroys the evidence. Always:
+reproduce. A blind restart destroys the evidence. Always use non-fatal
+diagnostics:
 
 ```bash
-# 1. Capture goroutine dump (safe — does not kill the process)
-kill -QUIT $(cat ~/gt/.dolt-data/dolt.pid)  # Dumps stacks to Dolt's stderr log
+# 1. Capture process metadata and recent logs without signaling Dolt
+{{cmd}} dolt dump 2>&1 | tee /tmp/dolt-hang-$(date +%s).log
 
 # 2. Capture server status while it's still (mis)behaving
-{{cmd}} dolt status 2>&1 | tee /tmp/dolt-hang-$(date +%s).log
+{{cmd}} dolt status 2>&1 | tee /tmp/dolt-status-$(date +%s).log
 
 # 3. THEN escalate with the evidence
 {{cmd}} escalate -s HIGH "Dolt: <describe symptom>"
 ```
 
+For Dolt outages and non-Dolt GT behavior mismatches, include the RCA capture checklist
+from `docs/dolt-health-guide.md` in the escalation or follow-up bead.
+
 **Do NOT just `{{cmd}} dolt stop && {{cmd}} dolt start` without steps 1-2.**
+**Do NOT use `kill -QUIT` for routine diagnostics.** Dolt 1.86.5 terminates
+`sql-server` after SIGQUIT; only use it if the current Dolt version has been
+verified not to exit on that signal.
 
 **Escalation path** (any agent can do this):
 ```bash
@@ -51,7 +58,7 @@ production server and degrade performance. This is a recurring problem.
 {{cmd}} dolt cleanup             # Remove orphan databases (safe — protects production DBs)
 ```
 
-**NEVER use `rm -rf` on `~/.dolt-data/` directories.** Use `{{cmd}} dolt cleanup` instead.
+**NEVER use `rm -rf` on `~/.dolt-data/` directories.** NEVER remove, delete, or modify files inside Dolt's `.dolt/` directory — including `noms/LOCK` files. These are Dolt-internal files. Removing them WILL cause unrecoverable data corruption and data loss. Dolt manages these files itself; external interference is never safe.
 
 ### Key commands
 ```bash
@@ -67,6 +74,19 @@ creates nothing. **Default to nudge for routine agent-to-agent communication.**
 
 Only use mail when the message MUST survive the recipient's session death
 (handoffs, structured protocol messages, escalations). See `mail-protocol.md`.
+
+## Agent Memory
+
+**Use `{{cmd}} remember`, not MEMORY.md.** Memories are stored in beads and injected
+at prime time. Do NOT use Claude Code's filesystem auto-memory (`~/.claude/*/memory/`).
+
+```bash
+{{cmd}} remember "insight"                 # Store a memory (auto-key)
+{{cmd}} remember --key my-slug "insight"   # Store with explicit key
+{{cmd}} memories                           # List all memories
+{{cmd}} memories search-term               # Search memories
+{{cmd}} forget my-slug                     # Remove a memory
+```
 
 ### War room
 Active incidents tracked in `mayor/DOLT-WAR-ROOM.md`. Full escalation protocol
